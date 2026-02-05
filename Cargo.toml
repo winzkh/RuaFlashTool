@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 clap = { version = "4.5.57", features = ["derive"] }
+figlet-rs = "0.1.5"
 rustyline = "17.0.2"
