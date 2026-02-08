@@ -1,0 +1,7 @@
+;!@Install@!UTF-8!
+Title="RuaFlashTool Release"
+ExtractTitle="正在解压 RuaFlashTool..."
+ExtractDialogText="请稍候，解压完成后将自动启动程序"
+RunProgram="RuaFlashTool_Release\\RuaFlashTool.exe"
+;!@InstallEnd@!
+

@@ -1,6 +1,6 @@
 [package]
 name = "RuaFlashTool"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 
 [dependencies]
@@ -8,3 +8,22 @@ clap = { version = "4.5.57", features = ["derive"] }
 colored = "3.1.1"
 figlet-rs = "0.1.5"
 rustyline = "17.0.2"
+rfd = "0.14.1"
+webbrowser = "1.0.1"
+zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
+anyhow = "1.0.100"
+android-bootimg = { git = "https://github.com/5ec1cff/android_bootimg", branch = "master" }
+lzma-rs = "0.3.0"
+sha1 = "0.10.6"
+flate2 = "1.0.35"
+ctrlc = "3.4.4"
+payload_dumper = { version = "0.8.2", features = ["local_zip"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1.86"
+num_cpus = "1.16"
+indicatif = "0.18.3"
+dashmap = "6.1.0"
+zstd = "0.13.3"
+lz4_flex = "0.12.0"
+uuid = { version = "1.20.0", features = ["v4"] }
+windows-sys = { version = "0.60.2", features = ["Win32_System_Console", "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
