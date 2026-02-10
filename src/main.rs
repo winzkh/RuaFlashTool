@@ -456,18 +456,18 @@ fn handle_menu_action(choice: &str, _debug: bool) {
                     println!("{}", ">> 请选择目标分区类型:".cyan());
                     println!("   1. boot      (适用于 Android 12 及以下，或部分无 init_boot 机型)");
                     println!("   2. ramdisk   (适用于部分华为/荣耀设备)");
-                    println!("   3. init_boot (适用于 Android 13+ 出厂机型)");
+                    println!("   3. init_boot (适用于 Android 13+ 出厂机型，默认)");
                     
                     let mut rl = DefaultEditor::new().unwrap();
-                    let target_partition = match rl.readline("请输入序号 (默认为 1): ") {
+                    let target_partition = match rl.readline("请输入序号 (默认为 3): ") {
                          Ok(line) => {
                              match line.trim() {
+                                 "1" => "boot",
                                  "2" => "ramdisk",
-                                 "3" => "init_boot",
-                                 _ => "boot",
+                                 _ => "init_boot",
                              }
                          },
-                         Err(_) => "boot", 
+                         Err(_) => "init_boot", 
                     };
 
                     println!("{}", format!(">> 请选择要修补的原始 {} 镜像 (.img)...", target_partition).yellow());
@@ -532,18 +532,18 @@ fn handle_menu_action(choice: &str, _debug: bool) {
                         
                         // 3. 询问分区 (同 Magisk)
                         crate::ui::step("请选择目标分区类型:");
-                        println!("   1. boot      (默认)");
+                        println!("   1. boot");
                         println!("   2. ramdisk");
-                        println!("   3. init_boot");
-                         let target_partition = match rl.readline("请输入序号 (默认为 1): ") {
+                        println!("   3. init_boot (默认)");
+                         let target_partition = match rl.readline("请输入序号 (默认为 3): ") {
                              Ok(line) => {
                                  match line.trim() {
+                                     "1" => "boot",
                                      "2" => "ramdisk",
-                                     "3" => "init_boot",
-                                     _ => "boot",
+                                     _ => "init_boot",
                                  }
                              },
-                             Err(_) => "boot", 
+                             Err(_) => "init_boot", 
                         };
 
                         crate::ui::warn(&format!("请选择原始 {} 镜像 (.img)...", target_partition));

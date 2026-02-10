@@ -1,5 +1,5 @@
 pub const APP_NAME: &str = "RuaFlashTool";
-pub const VERSION: &str = "0.0.4";
+pub const VERSION: &str = "0.1.0";
 pub const AUTHOR: &str = "酷安@射光灯";
 
 pub const QQ_GROUPS: &[&str] = &[
@@ -20,7 +20,7 @@ pub const MENU_OPTIONS: &[(&str, &str)] = &[
     ("1", "Fastboot一键刷入线刷包（小米线刷包专用）"),
     ("2", "Fastboot一键刷入卡刷包（适用卡刷包）"),
     ("3", "Fastboot一键刷入目录下全部分区"),
-    ("4", "FastbootD模式一键刷机"),
+    ("4", "FastbootD一键刷入目录下全部分区"),
     ("5", "一键安装刷机驱动"),
     ("6", "通用一键解锁Bootloader"),
     ("7", "回锁 Bootloader (谨慎操作)"),

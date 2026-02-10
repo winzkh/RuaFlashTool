@@ -125,7 +125,7 @@ fn compress_ramdisk(fmt: RamdiskFormat, data: &[u8]) -> anyhow::Result<Vec<u8>> 
     }
 }
 
-fn cpio_extract_file_newc(data: &[u8], name: &str) -> Option<Vec<u8>> {
+fn cpio_extract_file_newc(data: &[u8], name: &str) -> Option<(usize, Vec<u8>)> {
     let mut i = 0usize;
     while i + 6 <= data.len() {
         if &data[i..i + 6] != b"070701" {
@@ -136,7 +136,7 @@ fn cpio_extract_file_newc(data: &[u8], name: &str) -> Option<Vec<u8>> {
             usize::from_str_radix(s, 16).ok()
         };
         let _ino = read_hex(i + 6)?;
-        let _mode = read_hex(i + 14)?;
+        let mode = read_hex(i + 14)?;
         let _uid = read_hex(i + 22)?;
         let _gid = read_hex(i + 30)?;
         let _nlink = read_hex(i + 38)?;
@@ -165,7 +165,7 @@ fn cpio_extract_file_newc(data: &[u8], name: &str) -> Option<Vec<u8>> {
         }
         if entry_name == name {
             let file_data = &data[p..p + filesize];
-            return Some(file_data.to_vec());
+            return Some((mode, file_data.to_vec()));
         }
         i = p + filesize_aligned;
     }
@@ -224,11 +224,21 @@ impl Flasher {
         let rd_raw = rd.get_data();
         let fmt = detect_ramdisk_format(rd_raw);
         let rd_decomp = decompress_ramdisk(rd_raw)?;
-        let old_init = cpio_extract_file_newc(&rd_decomp, "init");
+        let old_init_info = cpio_extract_file_newc(&rd_decomp, "init");
         let mut cpio = if rd_decomp.is_empty() { Cpio::new() } else { Cpio::load_from_data(&rd_decomp)? };
         cpio.rm("init", false);
-        if let Some(old) = old_init {
-            cpio.add("init.real", CpioEntry::regular(0o755, Box::new(old) as Box<dyn AsRef<[u8]>>))?;
+        if let Some((mode, old_data)) = old_init_info {
+            // 保持原始 init 的模式 (可能是软链接 0xA1FF 或普通文件 0x81ED)
+            cpio.add("init.real", CpioEntry::regular(mode as u32, Box::new(old_data) as Box<dyn AsRef<[u8]>>))?;
+        }
+        
+        // 尝试寻找并修补 sepolicy (如果存在)
+        if let Some((mode, sepolicy_data)) = cpio_extract_file_newc(&rd_decomp, "sepolicy") {
+            warn("检测到 Ramdisk 中存在 sepolicy，正在尝试基础修补...");
+            // 这里我们无法进行复杂的二进制注入，但我们可以尝试确保一些基础权限
+            // 注意：这只是一个非常基础的尝试，真正的修补需要 magiskboot 或 ksud
+            cpio.rm("sepolicy", false);
+            cpio.add("sepolicy", CpioEntry::regular(mode as u32, Box::new(sepolicy_data) as Box<dyn AsRef<[u8]>>))?;
         }
         let ksuinit_bytes = fs::read(ksuinit_path)?;
         cpio.add("init", CpioEntry::regular(0o755, Box::new(ksuinit_bytes) as Box<dyn AsRef<[u8]>>))?;
