@@ -217,7 +217,7 @@ impl FastbootManager {
     /// 切换插槽
     pub fn set_active_slot(&self, slot: &str) -> io::Result<bool> {
         step(&format!("正在设置活动插槽为: {}", slot));
-        self.run_cmd(&["--set-active", slot])
+        self.run_cmd(&["set_active", slot])
     }
 
 

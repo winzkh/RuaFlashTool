@@ -269,12 +269,12 @@ fn handle_menu_action(choice: &str, _debug: bool) {
         "1" => {
             println!("{}", ">> [1] Fastboot一键刷入线刷包 (小米专用)".bright_green());
             if let Some(dir) = select_directory() {
-                let bat_path = dir.join("flash_all_expect_storages.bat");
+                let bat_path = dir.join("flash_all_expect_storage.bat");
                 if bat_path.exists() {
                     println!("{}", format!(">> 正在执行脚本: {:?}", bat_path).cyan());
                     let status = Command::new("cmd")
                         .arg("/c")
-                        .arg("flash_all_expect_storages.bat")
+                        .arg("flash_all_expect_storage.bat")
                         .current_dir(&dir)
                         .status();
                     match status {
@@ -282,7 +282,7 @@ fn handle_menu_action(choice: &str, _debug: bool) {
                         _ => eprintln!("{}", "失败: 脚本执行过程中出错".red()),
                     }
                 } else {
-                    eprintln!("{}", "错误: 未找到 flash_all_expect_storages.bat".red());
+                    eprintln!("{}", "错误: 未找到 flash_all_expect_storage.bat".red());
                 }
             }
         }
