@@ -24,7 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::System::Console::{
     GetConsoleWindow, GetStdHandle, SetConsoleScreenBufferSize, SetConsoleWindowInfo,
     STD_OUTPUT_HANDLE, CONSOLE_SCREEN_BUFFER_INFO, SMALL_RECT, COORD, GetConsoleScreenBufferInfo,
-    GetCurrentConsoleFontEx, CONSOLE_FONT_INFOEX, CONSOLE_FONT_INFO, GetCurrentConsoleFont
+    GetCurrentConsoleFontEx, SetCurrentConsoleFontEx, CONSOLE_FONT_INFOEX,
+    GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, ENABLE_VIRTUAL_TERMINAL_PROCESSING
 };
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::Foundation::{HANDLE, HWND, FALSE};
@@ -43,74 +44,86 @@ fn set_console_window_properties() {
             return;
         }
 
+        // Enable ANSI escape sequence processing
+        let mut mode: u32 = 0;
+        if GetConsoleMode(console_handle, &mut mode) != 0 {
+            SetConsoleMode(console_handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+
+        // Set console output code page to UTF-8
+        SetConsoleOutputCP(65001);
+
+        // Adjust font size on the current font
+        let mut font_info_ex: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+        font_info_ex.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
+        if GetCurrentConsoleFontEx(console_handle, FALSE, &mut font_info_ex) != FALSE {
+            font_info_ex.dwFontSize.X = 0;
+            font_info_ex.dwFontSize.Y = 18; // 调小字体
+            SetCurrentConsoleFontEx(console_handle, FALSE, &font_info_ex);
+        }
+
         let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
         if GetConsoleScreenBufferInfo(console_handle, &mut csbi) == 0 {
             return;
         }
 
         // Desired console window size (columns, rows)
-        let new_cols: i16 = 120;
-        let new_rows: i16 = 40;
+        let new_cols: i16 = 100;
+        let new_rows: i16 = 52; // 根据内容精确调整高度，防止产生滚动条
 
         // Set screen buffer size
-        let new_buffer_size = COORD { X: new_cols, Y: new_rows };
+        let new_buffer_size = COORD { X: new_cols, Y: 2000 }; 
         if SetConsoleScreenBufferSize(console_handle, new_buffer_size) == FALSE {
-            return;
+            let fallback_buffer_size = COORD { X: new_cols, Y: new_rows };
+            SetConsoleScreenBufferSize(console_handle, fallback_buffer_size);
         }
 
-        // Set console window size and position
+        // Get actual font size to calculate window dimensions correctly
+        let mut font_info_actual: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+        font_info_actual.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
+        GetCurrentConsoleFontEx(console_handle, FALSE, &mut font_info_actual);
+        
+        let font_w = if font_info_actual.dwFontSize.X == 0 { 12 } else { font_info_actual.dwFontSize.X as i32 };
+        let font_h = font_info_actual.dwFontSize.Y as i32;
+
+        // Set console window size
         let mut console_window_rect = SMALL_RECT {
             Left: 0,
             Top: 0,
             Right: new_cols - 1,
             Bottom: new_rows - 1,
         };
-        if SetConsoleWindowInfo(console_handle, FALSE, &mut console_window_rect) == FALSE {
-            return;
+        SetConsoleWindowInfo(console_handle, FALSE, &mut console_window_rect);
+
+        // Try to resize using ANSI escape sequence (works in some Windows Terminal configurations)
+        // Repeat it to increase the chance of the terminal responding
+        for _ in 0..3 {
+            print!("\x1b[8;{};{}t", new_rows, new_cols);
+            let _ = io::stdout().flush();
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
 
-        // Center the console window
+        // Center the console window with proper frame adjustment
         let hwnd: HWND = GetConsoleWindow();
-        if hwnd == std::ptr::null_mut() {
-            return;
-        }
+        if hwnd != std::ptr::null_mut() {
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut monitor_info: MONITORINFO = std::mem::zeroed();
+            monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+            
+            if GetMonitorInfoW(monitor, &mut monitor_info) != FALSE {
+                let screen_width = monitor_info.rcMonitor.right - monitor_info.rcMonitor.left;
+                let screen_height = monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top;
 
-        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-        if monitor == std::ptr::null_mut() {
-            return;
-        }
+                // Account for window decorations (title bar, borders) - approx 40px width, 80px height
+                let window_width = (new_cols as i32 * font_w) + 40;
+                let window_height = (new_rows as i32 * font_h) + 80;
 
-        let mut monitor_info: MONITORINFO = std::mem::zeroed();
-        monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-        if GetMonitorInfoW(monitor, &mut monitor_info) == FALSE {
-            return;
-        }
+                let x = (screen_width - window_width) / 2;
+                let y = (screen_height - window_height) / 2;
 
-        let screen_width = (monitor_info.rcMonitor.right - monitor_info.rcMonitor.left) as i32;
-        let screen_height = (monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top) as i32;
-
-        let mut font_info: CONSOLE_FONT_INFOEX = std::mem::zeroed();
-        font_info.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
-        if GetCurrentConsoleFontEx(console_handle, FALSE, &mut font_info) == FALSE {
-            // Fallback if GetCurrentConsoleFontEx fails
-            // Try to get font info using GetCurrentConsoleFont
-            let mut current_font: CONSOLE_FONT_INFO = std::mem::zeroed();
-            if GetCurrentConsoleFont(console_handle, FALSE, &mut current_font) == FALSE {
-                return;
+                MoveWindow(hwnd, x, y, window_width, window_height, 1);
             }
-            font_info.dwFontSize = current_font.dwFontSize;
         }
-
-        let font_width = font_info.dwFontSize.X as i32;
-        let font_height = font_info.dwFontSize.Y as i32;
-
-        let window_width = new_cols as i32 * font_width;
-        let window_height = new_rows as i32 * font_height;
-
-        let x = (screen_width - window_width) / 2;
-        let y = (screen_height - window_height) / 2;
-
-        MoveWindow(hwnd, x, y, window_width, window_height, FALSE);
     }
 }
 
@@ -144,11 +157,16 @@ fn main() {
 }
 
 fn clear_screen() {
-    print!("{}[2J{}[1;1H", 27 as char, 27 as char);
+    // \x1b[3J 清除滚动回溯缓冲区
+    // \x1b[2J 清除当前屏幕内容
+    // \x1b[H  将光标重置到左上角 (1,1)
+    // \x1b[?1049h 切换到备用屏幕缓冲区 (类似于 vim/less)，这样就不会有滚动条
+    print!("\x1b[?1049h\x1b[3J\x1b[2J\x1b[H");
     let _ = io::stdout().flush();
 }
 
 fn print_header() {
+    println!(); // 仅保留一个空行，防止顶部过于拥挤
     // 使用库生成的标准 FIGlet 字体
     let standard_font = FIGfont::standard().unwrap();
     if let Some(art) = standard_font.convert(APP_NAME) {
@@ -165,8 +183,8 @@ fn print_header() {
 fn refresh_ui() {
     clear_screen();
     print_header();
-    let divider = "=".repeat(60).white();
-    println!("\n{}", divider);
+    let divider = "=".repeat(100).white();
+    println!("{}", divider); // 移除这里的额外 \n
     for warning in WARNING_TEXTS {
         println!("{}", warning.red().bold());
     }
@@ -175,9 +193,13 @@ fn refresh_ui() {
         println!("{}", info.green());
     }
     println!("{}", divider);
-    for (id, desc) in MENU_OPTIONS {
-        println!("{:>2}. {}", id.bright_cyan(), desc);
+
+    for (id, desc) in MENU_OPTIONS.iter() {
+        let item_prefix = format!("{:>2}. ", id);
+        let colored_prefix = item_prefix.bright_cyan();
+        println!("{}{}", colored_prefix, desc);
     }
+
     println!("{}", divider);
 }
 
@@ -704,6 +726,55 @@ fn handle_menu_action(choice: &str, debug: bool) {
                 } else {
                     println!("{}", "错误: 无效的槽位名称。".red());
                 }
+            }
+        }
+        "29" => {
+            println!("{}", ">> [29] 激活 Shizuku 功能".bright_green());
+            println!("{}", ">> 正在检测 Shizuku 安装状态...".cyan());
+            let installed = fb.run_adb_cmd(&["shell", "ls", "/sdcard/Android/data/moe.shizuku.privileged.api/start.sh"]).unwrap_or(false);
+            if !installed {
+                eprintln!("{}", "错误: 未检测到 Shizuku 安装或启动脚本不存在".red());
+            } else {
+                println!("{}", ">> 正在启动 Shizuku...".cyan());
+                match fb.run_adb_cmd(&["shell", "sh", "/sdcard/Android/data/moe.shizuku.privileged.api/start.sh"]) {
+                    Ok(true) => println!("{}", "成功: 已尝试启动 Shizuku".green()),
+                    _ => eprintln!("{}", "失败: 启动 Shizuku 时出错".red()),
+                }
+            }
+        }
+        "30" => {
+            println!("{}", ">> [30] 激活 AxManager 功能".bright_green());
+            println!("{}", ">> 正在查找 AxManager 包路径...".cyan());
+            
+            // 使用 pm path 获取包的实际安装路径
+            let pkg_name = "frb.axeron.manager";
+            let pt_cmd = fb.get_adb_path();
+            let output = std::process::Command::new(pt_cmd)
+                .args(["shell", "pm", "path", pkg_name])
+                .output();
+
+            if let Ok(out) = output {
+                let path_str = String::from_utf8_lossy(&out.stdout);
+                if path_str.contains("package:") {
+                    // 格式通常是 package:/data/app/~~.../base.apk
+                    // 我们需要提取路径并定位到 lib/arm64/libaxeron.so
+                    let apk_path = path_str.trim().replace("package:", "");
+                    let pkg_dir = std::path::Path::new(&apk_path).parent().unwrap();
+                    let lib_path = pkg_dir.join("lib/arm64/libaxeron.so");
+                    let lib_path_str = lib_path.to_str().unwrap().replace("\\", "/");
+
+                    println!("{}", format!(">> 找到路径: {}", lib_path_str).green());
+                    println!("{}", ">> 正在启动 AxManager...".cyan());
+                    
+                    match fb.run_adb_cmd(&["shell", &lib_path_str]) {
+                        Ok(true) => println!("{}", "成功: 已尝试启动 AxManager".green()),
+                        _ => eprintln!("{}", "失败: 启动 AxManager 时出错".red()),
+                    }
+                } else {
+                    eprintln!("{}", "错误: 未找到 AxManager 安装路径，请确认是否已安装 Axeron Manager".red());
+                }
+            } else {
+                eprintln!("{}", "错误: 无法获取包信息".red());
             }
         }
 
