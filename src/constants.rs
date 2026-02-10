@@ -1,5 +1,5 @@
 pub const APP_NAME: &str = "RuaFlashTool";
-pub const VERSION: &str = "0.1.1";
+pub const VERSION: &str = "0.1.2";
 pub const AUTHOR: &str = "酷安@射光灯";
 
 pub const QQ_GROUPS: &[&str] = &[

@@ -191,20 +191,25 @@ impl FastbootManager {
     /// 等待设备连接
     pub fn wait_for_device(&self) -> io::Result<bool> {
         step("正在等待设备连接 (Fastboot 模式)...");
-        // 虽然 fastboot 有 wait-for-device 指令，但某些版本支持不佳
-        // 我们通过循环 get_devices 来实现更可靠的等待
+        // 修改为等待 15 秒并添加倒计时显示
         use std::thread;
         use std::time::Duration;
+        use std::io::{stdout, Write};
 
-        for _ in 0..60 { // 最多等待 60 秒
+        for i in (1..=15).rev() {
             let devices = self.get_devices()?;
             if !devices.is_empty() {
+                print!("\r"); // 清除倒计时行
+                stdout().flush()?;
                 ok(&format!("已发现设备: {} ({})", devices[0].serial, devices[0].mode));
                 return Ok(true);
             }
+            print!("\r>> 正在等待设备连接... {}s ", i);
+            stdout().flush()?;
             thread::sleep(Duration::from_secs(1));
         }
         
+        println!("\r"); 
         err("错误: 等待超时，未发现设备");
         Ok(false)
     }
@@ -226,14 +231,44 @@ impl FastbootManager {
 
     /// Fastboot Flashing Unlock (现代设备常用)
     pub fn flashing_unlock(&self) -> io::Result<bool> {
-        warn("正在尝试执行 flashing unlock...");
-        self.run_cmd(&["flashing", "unlock"])
+        warn("正在尝试执行解锁 Bootloader...");
+        // 尝试多种常用解锁命令组合
+        let cmds = [
+            vec!["flashing", "unlock"],
+            vec!["oem", "unlock"],
+            vec!["flash", "unlock"],
+        ];
+
+        for args in cmds {
+            step(&format!("尝试命令: fastboot {}", args.join(" ")));
+            if let Ok(success) = self.run_cmd(&args) {
+                if success { return Ok(true); }
+            }
+        }
+        
+        err("解锁失败: 所有已知解锁命令均执行失败，请手动确认设备是否支持或已开启 OEM 解锁开关");
+        Ok(false)
     }
 
     /// Fastboot Flashing Lock
     pub fn flashing_lock(&self) -> io::Result<bool> {
-        warn("正在尝试执行 flashing lock...");
-        self.run_cmd(&["flashing", "lock"])
+        warn("正在尝试执行回锁 Bootloader...");
+        // 尝试多种常用锁定命令组合
+        let cmds = [
+            vec!["flashing", "lock"],
+            vec!["oem", "lock"],
+            vec!["flash", "lock"],
+        ];
+
+        for args in cmds {
+            step(&format!("尝试命令: fastboot {}", args.join(" ")));
+            if let Ok(success) = self.run_cmd(&args) {
+                if success { return Ok(true); }
+            }
+        }
+
+        err("锁定失败: 所有已知回锁命令均执行失败");
+        Ok(false)
     }
 
     /// 清除数据 (fastboot -w)
@@ -295,14 +330,6 @@ pub mod ext {
         pub fn erase(&self, partition: &str) -> io::Result<bool> {
             step(&format!("正在擦除 {} 分区...", partition));
             self.run_cmd(&["erase", partition])
-        }
-        pub fn oem_unlock(&self) -> io::Result<bool> {
-            warn("正在尝试解锁 Bootloader...");
-            self.run_cmd(&["oem", "unlock"])
-        }
-        pub fn oem_lock(&self) -> io::Result<bool> {
-            warn("正在尝试锁定 Bootloader...");
-            self.run_cmd(&["oem", "lock"])
         }
     }
 }

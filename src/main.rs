@@ -269,20 +269,48 @@ fn handle_menu_action(choice: &str, _debug: bool) {
         "1" => {
             println!("{}", ">> [1] Fastboot一键刷入线刷包 (小米专用)".bright_green());
             if let Some(dir) = select_directory() {
-                let bat_path = dir.join("flash_all_expect_storage.bat");
-                if bat_path.exists() {
-                    println!("{}", format!(">> 正在执行脚本: {:?}", bat_path).cyan());
-                    let status = Command::new("cmd")
-                        .arg("/c")
-                        .arg("flash_all_expect_storage.bat")
-                        .current_dir(&dir)
-                        .status();
-                    match status {
-                        Ok(s) if s.success() => println!("{}", "成功: 脚本执行完成".green()),
-                        _ => eprintln!("{}", "失败: 脚本执行过程中出错".red()),
+                let mut available_scripts = Vec::new();
+                let scripts = [
+                    ("flash_all.bat", "刷入全部并清除Data (flash_all.bat)"),
+                    ("flash_all_lock.bat", "刷入全部并回锁 (flash_all_lock.bat)"),
+                    ("flash_all_expect_storage.bat", "刷入全部并保留Data (flash_all_expect_storage.bat)"),
+                ];
+
+                for (filename, desc) in scripts {
+                    if dir.join(filename).exists() {
+                        available_scripts.push((filename, desc));
                     }
+                }
+
+                if available_scripts.is_empty() {
+                    eprintln!("{}", "错误: 未在目录下找到任何小米线刷脚本 (.bat)".red());
                 } else {
-                    eprintln!("{}", "错误: 未找到 flash_all_expect_storage.bat".red());
+                    println!("{}", ">> 请选择要执行的刷机脚本:".cyan());
+                    for (i, (_, desc)) in available_scripts.iter().enumerate() {
+                        println!("   {}. {}", i + 1, desc);
+                    }
+
+                    let mut rl = DefaultEditor::new().unwrap();
+                    let choice_idx = match rl.readline("请输入序号 (直接回车取消): ") {
+                        Ok(line) => line.trim().parse::<usize>().unwrap_or(0),
+                        Err(_) => 0,
+                    };
+
+                    if choice_idx > 0 && choice_idx <= available_scripts.len() {
+                        let (selected_bat, _) = available_scripts[choice_idx - 1];
+                        println!("{}", format!(">> 正在执行脚本: {}", selected_bat).cyan());
+                        let status = Command::new("cmd")
+                            .arg("/c")
+                            .arg(selected_bat)
+                            .current_dir(&dir)
+                            .status();
+                        match status {
+                            Ok(s) if s.success() => println!("{}", "成功: 脚本执行完成".green()),
+                            _ => eprintln!("{}", "失败: 脚本执行过程中出错".red()),
+                        }
+                    } else {
+                        println!("{}", "已取消操作。".yellow());
+                    }
                 }
             }
         }
