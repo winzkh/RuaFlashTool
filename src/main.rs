@@ -243,12 +243,9 @@ fn run_interactive_loop(debug: bool) -> Result<(), ReadlineError> {
     Ok(())
 }
 
-fn handle_menu_action(choice: &str, debug: bool) {
+fn handle_menu_action(choice: &str, _debug: bool) {
     println!(); 
-    if debug {
-        println!("{}", format!("[DEBUG] 执行指令: {}", choice).yellow());
-    }
-
+    
     let fb = match FastbootManager::new() {
         Ok(f) => f,
         Err(e) => {
@@ -637,10 +634,32 @@ fn handle_menu_action(choice: &str, debug: bool) {
                 }
                 Ok(devices) => {
                     println!("{}", format!(">> 已发现 {} 个设备:", devices.len()).green());
-                    for (i, sn) in devices.iter().enumerate() {
-                        print!("   {}. 序列号: {}", i + 1, sn.bright_cyan());
-                        if let Ok(prod) = fb.get_var("product") { print!("  型号: {}", prod.yellow()); }
-                        if let Ok(slot) = fb.get_current_slot() { print!("  当前槽位: {}", slot.magenta()); }
+                    for (i, dev) in devices.iter().enumerate() {
+                        print!("   {}. 序列号: {}", i + 1, dev.serial.bright_cyan());
+                        
+                        // 根据模式安全地获取型号
+                        if dev.mode == "Fastboot" {
+                            if let Ok(prod) = fb.get_var("product") {
+                                print!("  型号: {} (Fastboot)", prod.yellow());
+                            } else {
+                                print!(" (Fastboot)");
+                            }
+                        } else if dev.mode == "ADB" && dev.status == "device" {
+                            if let Ok(model) = fb.get_adb_var(&dev.serial, "ro.product.model") {
+                                print!("  型号: {} (ADB)", model.yellow());
+                            } else {
+                                print!(" (ADB)");
+                            }
+                        } else {
+                            print!(" ({})", dev.mode.cyan());
+                        }
+
+                        // 仅在 Fastboot 模式尝试获取槽位
+                        if dev.mode == "Fastboot" {
+                            if let Ok(slot) = fb.get_current_slot() {
+                                print!("  当前槽位: {}", slot.magenta());
+                            }
+                        }
                         println!();
                     }
                 }
@@ -775,6 +794,15 @@ fn handle_menu_action(choice: &str, debug: bool) {
                 }
             } else {
                 eprintln!("{}", "错误: 无法获取包信息".red());
+            }
+        }
+        "31" => {
+            println!("{}", ">> [31] 正在打开设备管理器...".bright_green());
+            #[cfg(target_os = "windows")]
+            {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/c", "start", "devmgmt.msc"])
+                    .spawn();
             }
         }
 

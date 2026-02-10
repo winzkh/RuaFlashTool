@@ -1,5 +1,5 @@
 pub const APP_NAME: &str = "RuaFlashTool";
-pub const VERSION: &str = "0.0.3";
+pub const VERSION: &str = "0.0.4";
 pub const AUTHOR: &str = "酷安@射光灯";
 
 pub const QQ_GROUPS: &[&str] = &[
@@ -47,6 +47,7 @@ pub const MENU_OPTIONS: &[(&str, &str)] = &[
     ("28", "切换槽位 (极其危险)"),
     ("29", "激活 Shizuku"),
     ("30", "激活 AxManager"),
+    ("31", "打开设备管理器"),
     ("0", "退出程序"),
 ];
 

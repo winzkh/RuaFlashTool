@@ -9,6 +9,13 @@ pub struct FastbootManager {
     executable_path: PathBuf,
 }
 
+#[derive(Debug, Clone)]
+pub struct Device {
+    pub serial: String,
+    pub mode: String,   // "Fastboot", "ADB", "Recovery", "Sideload"
+    pub status: String, // "device", "unauthorized", "offline", etc.
+}
+
 impl FastbootManager {
     /// 初始化 Fastboot 管理器
     pub fn new() -> io::Result<Self> {
@@ -73,22 +80,74 @@ impl FastbootManager {
             .output()
     }
 
+    /// 执行 adb 命令并捕获输出内容 (不打印到控制台)
+    pub fn capture_adb_cmd(&self, args: &[&str]) -> io::Result<Output> {
+        let path = self.get_adb_path();
+        Command::new(path)
+            .args(args)
+            .output()
+    }
+
+    /// 获取 ADB 设备的系统属性
+    pub fn get_adb_var(&self, sn: &str, prop: &str) -> io::Result<String> {
+        let output = self.capture_adb_cmd(&["-s", sn, "shell", "getprop", prop])?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if stdout.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Property not found"));
+        }
+        Ok(stdout)
+    }
+
     // --- 便捷接口 ---
 
-    /// 获取已连接的设备列表
-    pub fn get_devices(&self) -> io::Result<Vec<String>> {
-        let output = self.capture_cmd(&["devices"])?;
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let devices = stdout.lines()
-            .filter_map(|line| {
+    /// 获取已连接的设备列表 (包含 Fastboot 和 ADB 模式)
+    pub fn get_devices(&self) -> io::Result<Vec<Device>> {
+        let mut devices = Vec::new();
+
+        // 1. 获取 Fastboot 设备
+        if let Ok(output) = self.capture_cmd(&["devices"]) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() >= 1 {
-                    Some(parts[0].to_string())
-                } else {
-                    None
+                    devices.push(Device {
+                        serial: parts[0].to_string(),
+                        mode: "Fastboot".to_string(),
+                        status: "fastboot".to_string(),
+                    });
                 }
-            })
-            .collect();
+            }
+        }
+
+        // 2. 获取 ADB 设备
+        if let Ok(output) = self.capture_adb_cmd(&["devices"]) {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // adb devices 输出第一行是 "List of devices attached"，需要跳过
+            for line in stdout.lines().skip(1) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let serial = parts[0].to_string();
+                    let status = parts[1].to_string();
+                    
+                    // 如果 Fastboot 列表里已经有了（虽然序列号可能冲突，但通常不会同时出现），则以 Fastboot 为准或并存
+                    // 这里我们允许并存，或者更新信息
+                    let mode = match status.as_str() {
+                        "device" => "ADB",
+                        "recovery" => "Recovery",
+                        "sideload" => "Sideload",
+                        "unauthorized" => "ADB (未授权)",
+                        _ => "ADB",
+                    };
+
+                    devices.push(Device {
+                        serial,
+                        mode: mode.to_string(),
+                        status,
+                    });
+                }
+            }
+        }
+
         Ok(devices)
     }
 
@@ -140,7 +199,7 @@ impl FastbootManager {
         for _ in 0..60 { // 最多等待 60 秒
             let devices = self.get_devices()?;
             if !devices.is_empty() {
-                ok(&format!("已发现设备: {}", devices[0]));
+                ok(&format!("已发现设备: {} ({})", devices[0].serial, devices[0].mode));
                 return Ok(true);
             }
             thread::sleep(Duration::from_secs(1));
