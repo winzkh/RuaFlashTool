@@ -31,13 +31,13 @@ Write-Host "编译成功！" -ForegroundColor Green
 Write-Host "开始打包 RuaFlashTool..." -ForegroundColor Green
 
 # 1. 复制 Release 可执行文件
-Write-Host "复制 RuaFlashTool.exe..." -ForegroundColor Cyan
-$releaseExePath = "target/release/RuaFlashTool.exe"
+Write-Host "复制 rua_cli.exe..." -ForegroundColor Cyan
+$releaseExePath = "target/release/rua_cli.exe"
 if (Test-Path $releaseExePath) {
     Copy-Item $releaseExePath -Destination $outputDir
-    Write-Host "RuaFlashTool.exe 复制成功。" -ForegroundColor Green
+    Write-Host "rua_cli.exe 复制成功。" -ForegroundColor Green
 } else {
-    Write-Host "错误: 未找到 RuaFlashTool.exe。请先运行 'cargo build --release'。" -ForegroundColor Red
+    Write-Host "错误: 未找到 rua_cli.exe。请先运行 'cargo build --release'。" -ForegroundColor Red
     exit 1
 }
 
