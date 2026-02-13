@@ -3,7 +3,7 @@ name = "rua_cli"
 version = "1.0.0-rc0"
 edition = "2024"
 license = "GPL-3.0"
-repository = "https://github.com/yourusername/RuaFlashTool"
+repository = "https://github.com/winzkh/RuaFlashTool"
 description = "CLI tool for RuaFlashTool - Android flashing tool"
 
 [dependencies]
