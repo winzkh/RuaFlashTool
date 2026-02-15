@@ -1,14 +1,12 @@
 use tokio::process::Command;
 use std::path::PathBuf;
 use std::env;
-use colored::*;
 use crate::error::{FlashError, Result};
 use crate::device::{ConnectedDevice, DeviceMode};
 
 #[derive(Clone)]
 pub struct FastbootClient {
     fastboot_path: PathBuf,
-    pub debug: bool,
     pub selected_serial: Option<String>,
 }
 
@@ -38,13 +36,8 @@ impl FastbootClient {
 
         Ok(Self {
             fastboot_path,
-            debug: false,
             selected_serial: None,
         })
-    }
-
-    pub fn set_debug(&mut self, debug: bool) {
-        self.debug = debug;
     }
 
     pub fn set_serial(&mut self, serial: Option<String>) {
@@ -69,11 +62,6 @@ impl FastbootClient {
 
     pub async fn run(&self, args: &[&str]) -> Result<bool> {
         let cmd_args = self.build_args(args);
-        if self.debug {
-            let cmd_name = self.fastboot_path.file_name().and_then(|f| f.to_str()).unwrap_or("fastboot");
-            println!("\n{} [模拟] 执行: {} {}", ">>".yellow(), cmd_name, cmd_args.join(" "));
-            return Ok(true);
-        }
         let status = Command::new(&self.fastboot_path)
             .args(&cmd_args)
             .status()
@@ -83,17 +71,6 @@ impl FastbootClient {
 
     pub async fn capture(&self, args: &[&str]) -> Result<String> {
         let cmd_args = self.build_args(args);
-        if self.debug {
-            let cmd_name = self.fastboot_path.file_name().and_then(|f| f.to_str()).unwrap_or("fastboot");
-            println!("\n{} [模拟] 捕获输出: {} {}", ">>".yellow(), cmd_name, cmd_args.join(" "));
-            if args.contains(&"devices") {
-                return Ok("EMULATOR12345\tfastboot".to_string());
-            }
-            if args.contains(&"getvar") {
-                return Ok("product: EMULATOR\ncurrent-slot: a".to_string());
-            }
-            return Ok("".to_string());
-        }
         let output = Command::new(&self.fastboot_path)
             .args(&cmd_args)
             .output()

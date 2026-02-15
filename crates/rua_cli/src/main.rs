@@ -15,41 +15,94 @@ use std::fs;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use rua_core::payload::{self, ProgressReporter};
-use std::sync::Arc;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::sync::{Arc, Mutex};
 use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
+use std::time::{Instant, Duration};
 
-struct ConsoleReporter;
-impl ProgressReporter for ConsoleReporter {
-    fn on_start(&self, name: &str, _total: u64) {
-        println!(">> 开始解包分区: {}", name);
+struct PartitionStat { total: u64, start: Instant, elapsed: Option<Duration> }
+struct ConsoleReporter { pb: Mutex<Option<ProgressBar>>, stats: Mutex<HashMap<String, PartitionStat>> }
+impl ConsoleReporter {
+    fn new() -> Self { Self { pb: Mutex::new(None), stats: Mutex::new(HashMap::new()) } }
+    fn clear_current(&self, msg: &str) {
+        if let Some(pb) = self.pb.lock().unwrap().take() {
+            pb.finish_and_clear();
+            println!("{}", msg);
+        }
     }
-    fn on_progress(&self, name: &str, current: u64, total: u64) {
-        if current % 100 == 0 || current == total {
-            print!("\r>> 解包 {}: {}/{}", name, current, total);
-            let _ = io::stdout().flush();
+    fn print_summary(&self) {
+        let stats = self.stats.lock().unwrap();
+        if stats.is_empty() { return; }
+        let mut total_bytes: u128 = 0;
+        let mut total_secs: f64 = 0.0;
+        let mut max_speed: f64 = 0.0;
+        let mut max_name = String::new();
+        let mut min_speed: f64 = f64::MAX;
+        let mut min_name = String::new();
+        for (name, s) in stats.iter() {
+            if let Some(el) = s.elapsed {
+                let secs = el.as_secs_f64().max(1e-6);
+                let speed = (s.total as f64) / secs / (1024.0 * 1024.0);
+                total_bytes += s.total as u128;
+                total_secs += secs;
+                if speed > max_speed { max_speed = speed; max_name = name.clone(); }
+                if speed < min_speed { min_speed = speed; min_name = name.clone(); }
+            }
+        }
+        if total_secs > 0.0 {
+            let avg = (total_bytes as f64) / total_secs / (1024.0 * 1024.0);
+            println!("\n统计: 分区数 {}  平均速度 {:.2} MiB/s  最高 {:.2} MiB/s [{}]  最低 {:.2} MiB/s [{}]",
+                stats.len(), avg, max_speed, max_name, min_speed, min_name);
+        } else {
+            println!("\n统计: 分区数 {}", stats.len());
+        }
+    }
+}
+impl ProgressReporter for ConsoleReporter {
+    fn should_cancel(&self) -> bool {
+        INTERRUPTED.load(Ordering::SeqCst)
+    }
+    fn on_start(&self, name: &str, total: u64) {
+        let pb = if total > 0 { ProgressBar::new(total) } else { ProgressBar::new_spinner() };
+        let style = ProgressStyle::with_template("{spinner} {msg} [{elapsed_precise}<{eta_precise}] {wide_bar} {bytes}/{total_bytes} {bytes_per_sec}").unwrap()
+            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]);
+        pb.set_style(style);
+        pb.set_message(format!("解包 {}", name));
+        *self.pb.lock().unwrap() = Some(pb);
+        self.stats.lock().unwrap().insert(name.to_string(), PartitionStat { total, start: Instant::now(), elapsed: None });
+    }
+    fn on_progress(&self, _name: &str, current: u64, total: u64) {
+        if let Some(pb) = self.pb.lock().unwrap().as_ref() {
+            if total > 0 { pb.set_position(current); }
+            pb.tick();
         }
     }
     fn on_complete(&self, name: &str, _total: u64) {
-        println!("\r>> 解包分区 {} 完成！            ", name);
+        if let Some(pb) = self.pb.lock().unwrap().take() {
+            pb.finish_with_message(format!("{} 完成", name));
+        }
+        if let Some(s) = self.stats.lock().unwrap().get_mut(name) {
+            s.elapsed = Some(s.start.elapsed());
+        }
     }
     fn on_warning(&self, name: &str, _idx: usize, msg: String) {
-        println!("\n>> [警告] 分区 {}: {}", name, msg);
+        if let Some(pb) = self.pb.lock().unwrap().as_ref() {
+            pb.println(format!("[警告] {}: {}", name, msg));
+        } else {
+            println!("[警告] {}: {}", name, msg);
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 use windows_sys::Win32::System::Console::{
-    GetConsoleWindow, GetStdHandle, SetConsoleScreenBufferSize, SetConsoleWindowInfo,
-    STD_OUTPUT_HANDLE, CONSOLE_SCREEN_BUFFER_INFO, SMALL_RECT, COORD, GetConsoleScreenBufferInfo,
-    GetCurrentConsoleFontEx, SetCurrentConsoleFontEx, CONSOLE_FONT_INFOEX,
-    GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    GetStdHandle, GetConsoleMode, SetConsoleMode, SetConsoleOutputCP, GetConsoleScreenBufferInfo,
+    SetConsoleScreenBufferSize, SetConsoleWindowInfo, STD_OUTPUT_HANDLE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    CONSOLE_SCREEN_BUFFER_INFO, SMALL_RECT, COORD,
 };
 #[cfg(target_os = "windows")]
-use windows_sys::Win32::Foundation::{HANDLE, HWND, FALSE};
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
-#[cfg(target_os = "windows")]
-use windows_sys::Win32::UI::WindowsAndMessaging::MoveWindow;
+use windows_sys::Win32::Foundation::HANDLE;
 
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -66,75 +119,64 @@ fn set_console_window_properties() {
         }
 
         let mut mode: u32 = 0;
-        if GetConsoleMode(console_handle, &mut mode) != 0 {
-            SetConsoleMode(console_handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        if windows_sys::Win32::System::Console::GetConsoleMode(console_handle, &mut mode) != 0 {
+            let _ = SetConsoleMode(console_handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         }
 
         SetConsoleOutputCP(65001);
 
-        let mut font_info_ex: CONSOLE_FONT_INFOEX = std::mem::zeroed();
-        font_info_ex.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
-        if GetCurrentConsoleFontEx(console_handle, FALSE, &mut font_info_ex) != FALSE {
-            font_info_ex.dwFontSize.X = 0;
-            font_info_ex.dwFontSize.Y = 18;
-            SetCurrentConsoleFontEx(console_handle, FALSE, &font_info_ex);
-        }
-
-        let mut csbi: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
-        if GetConsoleScreenBufferInfo(console_handle, &mut csbi) == 0 {
+        let (need_cols, need_rows) = compute_required_console_size();
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(console_handle, &mut info) == 0 {
             return;
         }
-
-        let new_cols: i16 = 100;
-        let new_rows: i16 = 52;
-
-        let new_buffer_size = COORD { X: new_cols, Y: 2000 }; 
-        if SetConsoleScreenBufferSize(console_handle, new_buffer_size) == FALSE {
-            let fallback_buffer_size = COORD { X: new_cols, Y: new_rows };
-            SetConsoleScreenBufferSize(console_handle, fallback_buffer_size);
+        let cur_cols = (info.srWindow.Right - info.srWindow.Left + 1) as i16;
+        let cur_rows = (info.srWindow.Bottom - info.srWindow.Top + 1) as i16;
+        let cur_buf_cols = info.dwSize.X;
+        let cur_buf_rows = info.dwSize.Y;
+        let target_cols = (need_cols.min(160)) as i16;
+        let target_rows = (need_rows.min(60)) as i16;
+        let mut rect = SMALL_RECT { Left: 0, Top: 0, Right: target_cols - 1, Bottom: target_rows - 1 };
+        if target_cols > cur_buf_cols || target_rows > cur_buf_rows {
+            let buf = COORD { X: target_cols.max(cur_buf_cols), Y: target_rows.max(cur_buf_rows) };
+            let _ = SetConsoleScreenBufferSize(console_handle, buf);
         }
-
-        let mut font_info_actual: CONSOLE_FONT_INFOEX = std::mem::zeroed();
-        font_info_actual.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
-        GetCurrentConsoleFontEx(console_handle, FALSE, &mut font_info_actual);
-        
-        let font_w = if font_info_actual.dwFontSize.X == 0 { 12 } else { font_info_actual.dwFontSize.X as i32 };
-        let font_h = font_info_actual.dwFontSize.Y as i32;
-
-        let mut console_window_rect = SMALL_RECT {
-            Left: 0,
-            Top: 0,
-            Right: new_cols - 1,
-            Bottom: new_rows - 1,
-        };
-        SetConsoleWindowInfo(console_handle, FALSE, &mut console_window_rect);
-
-        for _ in 0..3 {
-            print!("\x1b[8;{};{}t", new_rows, new_cols);
-            let _ = io::stdout().flush();
-            std::thread::sleep(std::time::Duration::from_millis(50));
+        if target_cols > cur_cols || target_rows > cur_rows {
+            let _ = SetConsoleWindowInfo(console_handle, 1, &mut rect as *mut _);
         }
-
-        let hwnd: HWND = GetConsoleWindow();
-        if hwnd != std::ptr::null_mut() {
-            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-            let mut monitor_info: MONITORINFO = std::mem::zeroed();
-            monitor_info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
-            
-            if GetMonitorInfoW(monitor, &mut monitor_info) != FALSE {
-                let screen_width = monitor_info.rcMonitor.right - monitor_info.rcMonitor.left;
-                let screen_height = monitor_info.rcMonitor.bottom - monitor_info.rcMonitor.top;
-
-                let window_width = (new_cols as i32 * font_w) + 40;
-                let window_height = (new_rows as i32 * font_h) + 80;
-
-                let x = (screen_width - window_width) / 2;
-                let y = (screen_height - window_height) / 2;
-
-                MoveWindow(hwnd, x, y, window_width, window_height, 1);
-            }
+        let mut info2: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(console_handle, &mut info2) == 0 {
+            return;
+        }
+        let cur_cols2 = (info2.srWindow.Right - info2.srWindow.Left + 1) as i16;
+        let cur_rows2 = (info2.srWindow.Bottom - info2.srWindow.Top + 1) as i16;
+        if (target_cols < cur_cols2 || target_rows < cur_rows2)
+            && target_cols <= info2.dwSize.X
+            && target_rows <= info2.dwSize.Y
+        {
+            rect = SMALL_RECT { Left: 0, Top: 0, Right: target_cols - 1, Bottom: target_rows - 1 };
+            let _ = SetConsoleWindowInfo(console_handle, 1, &mut rect as *mut _);
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn compute_required_console_size() -> (i32, i32) {
+    use rua_core::constants::*;
+    let mut maxw = 100usize;
+    for s in WARNING_TEXTS {
+        maxw = maxw.max(s.chars().count() + 6);
+    }
+    for s in INFO_TEXTS {
+        maxw = maxw.max(s.chars().count() + 4);
+    }
+    for (_id, desc) in MENU_OPTIONS {
+        let w = 4 + desc.chars().count();
+        maxw = maxw.max(w);
+    }
+    let cols = (maxw as i32).clamp(100, 200);
+    let rows = (MENU_OPTIONS.len() as i32 + 22).clamp(30, 80);
+    (cols, rows)
 }
 
 #[tokio::main]
@@ -341,19 +383,43 @@ async fn flash_xiaomi_fastboot() {
 async fn unpack_payload() {
     if let Some(path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) {
         let output_dir = Path::new("extracted_payload").to_path_buf();
-        let _ = fs::create_dir_all(&output_dir);
-        ui::step(&format!("正在处理 Payload 到 {} ...", output_dir.display()));
-        
-        let path_clone = path.clone();
-        tokio::spawn(async move {
-            let reporter = Arc::new(ConsoleReporter);
-            if let Err(e) = payload::unpack_payload(&path_clone, &output_dir, reporter).await {
-                eprintln!("\n处理失败: {:?}", e);
+        if output_dir.exists() {
+            let msg = format!("检测到上次解包目录已存在: {}\n是否删除后重新解包？ [Y/n]", output_dir.display());
+            if ui::confirm(&msg, true) {
+                if let Err(e) = fs::remove_dir_all(&output_dir) {
+                    ui::err(&format!("删除旧目录失败: {:?}", e));
+                    return;
+                }
             } else {
-                println!("\n处理完成！文件保存在: {}", output_dir.display());
+                ui::warn("已取消解包操作。");
+                return;
             }
-        });
-        println!("{}", "任务已在后台启动，您可以继续其他操作。".green());
+        }
+        if let Err(e) = fs::create_dir_all(&output_dir) {
+            ui::err(&format!("创建输出目录失败: {:?}", e));
+            return;
+        }
+        ui::step(&format!("正在处理 Payload 到 {} ...", output_dir.display()));
+
+        let reporter = Arc::new(ConsoleReporter::new());
+        let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+        if let Err(e) = payload::unpack_payload(&path, &output_dir, reporter_dyn).await {
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                reporter.clear_current(">> 已取消解包");
+                ui::warn("已取消解包操作。");
+            } else {
+                ui::err(&format!("处理失败: {:?}", e));
+            }
+        } else {
+            ui::ok(&format!("处理完成！文件保存在: {}", output_dir.display()));
+            reporter.print_summary();
+            if let Ok(client) = FastbootClient::new() {
+                let flasher = Flasher::new(client.clone());
+                flash_select_partitions_in_dir(&flasher, &output_dir, false).await;
+            } else {
+                ui::err("无法初始化 Fastboot 客户端");
+            }
+        }
     }
 }
 
@@ -361,23 +427,131 @@ async fn flash_all_partitions(flasher: &Flasher, fastboot_mode: bool) {
     let mode_str = if fastboot_mode { "Fastboot" } else { "FastbootD" };
     ui::step(&format!("正在目录下查找分区镜像刷入 ({})...", mode_str));
     if let Some(dir) = ui::select_directory("请选择包含分区镜像 (.img) 的目录") {
-        let mut entries: Vec<_> = fs::read_dir(dir).unwrap().flatten().collect();
+        let mut entries: Vec<_> = fs::read_dir(&dir).unwrap().flatten()
+            .filter(|e| e.path().is_file() && e.path().extension().map_or(false, |ext| ext == "img"))
+            .collect();
         entries.sort_by_key(|e| e.file_name());
-        
-        for entry in entries {
-            let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |ext| ext == "img") {
-                let partition = path.file_stem().unwrap().to_str().unwrap();
-                ui::step(&format!("正在刷入 {}: {} ...", partition, path.display()));
-                if let Err(e) = flasher.flash_partition("", partition, &path.to_string_lossy()).await {
-                    ui::err(&format!("✗ {} 刷入失败: {:?}", partition, e));
-                } else {
-                    ui::ok(&format!("✓ {} 刷入成功", partition));
+        let parts: Vec<(String, String)> = entries.iter().map(|e| {
+            let p = e.path();
+            let name = p.file_stem().unwrap().to_string_lossy().to_string();
+            (name, p.to_string_lossy().to_string())
+        }).collect();
+        if parts.is_empty() {
+            ui::warn("目录下未发现任何 .img 文件");
+            return;
+        }
+        println!("\n待刷入分区列表:");
+        let divider = "=".repeat(60).white();
+        println!("{}", divider);
+        for (i, (n, _)) in parts.iter().enumerate() {
+            println!("{}{}", format!("{:>3}. ", i + 1).bright_cyan(), n);
+        }
+        println!("{}", divider);
+        if !ui::confirm("确认开始刷入吗？", false) { ui::warn("已取消刷入。"); return; }
+        let target_device = select_device(&flasher.client).await;
+        if target_device.is_empty() {
+            ui::warn("未选择设备，取消刷入。");
+            return;
+        }
+        print!("输入要跳过的分区名，逗号分隔，直接回车全部刷入: ");
+        let _ = io::stdout().flush();
+        let mut skip_line = String::new();
+        let _ = io::stdin().read_line(&mut skip_line);
+        let skip_set: HashSet<String> = skip_line
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        for (name, path) in parts {
+            if skip_set.contains(&name.to_lowercase()) {
+                ui::warn(&format!("跳过 {}", name));
+                continue;
+            }
+            ui::step(&format!("正在刷入 {}: {} ...", name, path));
+            if let Err(e) = flasher.flash_partition(&target_device, &name, &path).await {
+                ui::err(&format!("✗ {} 刷入失败: {:?}", name, e));
+            } else {
+                ui::ok(&format!("✓ {} 刷入成功", name));
+            }
+        }
+        ui::ok("刷入完成。");
+    }
+}
+
+async fn flash_select_partitions_in_dir(flasher: &Flasher, dir: &Path, fastboot_mode: bool) {
+    let mode_str = if fastboot_mode { "Fastboot" } else { "FastbootD" };
+    ui::step(&format!("从目录选择分区刷入 ({}) ...", mode_str));
+    let mut entries: Vec<_> = match fs::read_dir(dir) {
+        Ok(rd) => rd.flatten()
+            .filter(|e| e.path().is_file() && e.path().extension().map_or(false, |ext| ext == "img"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    entries.sort_by_key(|e| e.file_name());
+    let parts: Vec<(String, String)> = entries.iter().map(|e| {
+        let p = e.path();
+        let name = p.file_stem().unwrap().to_string_lossy().to_string();
+        (name, p.to_string_lossy().to_string())
+    }).collect();
+    if parts.is_empty() {
+        ui::warn("目录下未发现任何 .img 文件");
+        return;
+    }
+    println!("\n解包得到的分区列表:");
+    let divider = "=".repeat(60).white();
+    println!("{}", divider);
+    for (i, (n, _)) in parts.iter().enumerate() {
+        println!("{}{}", format!("{:>3}. ", i + 1).bright_cyan(), n);
+    }
+    println!("{}", divider);
+    print!("请输入要刷入的分区序号或名称，逗号分隔，直接回车表示全部: ");
+    let _ = io::stdout().flush();
+    let mut sel = String::new();
+    let _ = io::stdin().read_line(&mut sel);
+    let sel = sel.trim();
+    let selected: Vec<(String, String)> = if sel.is_empty() {
+        parts.clone()
+    } else {
+        let tokens: Vec<String> = sel.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        let mut picked = Vec::new();
+        for t in tokens {
+            if let Ok(idx) = t.parse::<usize>() {
+                if idx >= 1 && idx <= parts.len() {
+                    picked.push(parts[idx - 1].clone());
+                }
+            } else {
+                if let Some(p) = parts.iter().find(|(n, _)| n.eq_ignore_ascii_case(&t)) {
+                    picked.push(p.clone());
                 }
             }
         }
-        ui::ok("全部刷入尝试完成。");
+        if picked.is_empty() { parts.clone() } else { picked }
+    };
+    if selected.is_empty() {
+        ui::warn("未选择任何分区。");
+        return;
     }
+    println!("\n即将刷入以下分区:");
+    println!("{}", divider);
+    for (n, _) in &selected {
+        println!("{}", n);
+    }
+    println!("{}", divider);
+    if !ui::confirm("确认开始刷入吗？", true) { ui::warn("已取消刷入。"); return; }
+    let target_device = select_device(&flasher.client).await;
+    if target_device.is_empty() {
+        ui::warn("未选择设备，取消刷入。");
+        return;
+    }
+    for (name, path) in selected {
+        ui::step(&format!("正在刷入 {}: {} ...", name, path));
+        if let Err(e) = flasher.flash_partition(&target_device, &name, &path).await {
+            ui::err(&format!("✗ {} 刷入失败: {:?}", name, e));
+        } else {
+            ui::ok(&format!("✓ {} 刷入成功", name));
+        }
+    }
+    ui::ok("刷入完成。");
 }
 
 async fn manage_bootloader(client: &FastbootClient) {
@@ -526,8 +700,46 @@ async fn flash_magisk(flasher: &Flasher) {
                 return;
             }
 
-            let Some(boot_path) = ui::select_file("请选择要修补的 Boot 镜像", &["img"]) else {
-                return;
+            println!("\n{} {}", ">>".cyan().bold(), "请选择镜像来源:".bright_white());
+            println!("{}", "=".repeat(60).white());
+            println!("{} 本地镜像", "1)".bright_cyan());
+            println!("{} 从 Payload/卡刷包 获取", "2)".bright_cyan());
+            println!("{}", "=".repeat(60).white());
+            print!("请选择 [1/2]: ");
+            let _ = io::stdout().flush();
+            let mut src_choice = String::new();
+            let _ = io::stdin().read_line(&mut src_choice);
+            let src_choice = src_choice.trim();
+
+            let boot_path: PathBuf = if src_choice == "2" {
+                ui::step(&format!("正在从 Payload 提取 {} 分区镜像...", partition));
+                let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else {
+                    return;
+                };
+                let out_dir = Path::new("extracted_payload");
+                let _ = fs::create_dir_all(out_dir);
+                let reporter = Arc::new(ConsoleReporter::new());
+                let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+                match rua_core::payload::extract_single_partition(&payload_path, &partition, out_dir, reporter_dyn).await {
+                    Ok(p) => {
+                        reporter.print_summary();
+                        p
+                    }
+                    Err(e) => {
+                        if INTERRUPTED.load(Ordering::SeqCst) {
+                            reporter.clear_current(">> 已取消提取");
+                            ui::warn("已取消操作。");
+                        } else {
+                            ui::err(&format!("从 Payload 提取分区失败: {:?}", e));
+                        }
+                        return;
+                    }
+                }
+            } else {
+                match ui::select_file("请选择要修补的 Boot 镜像", &["img"]) {
+                    Some(p) => p,
+                    None => return,
+                }
             };
 
             let boot_path_str = boot_path.to_string_lossy().to_string();
@@ -646,8 +858,49 @@ async fn flash_apatch(flasher: &Flasher) {
         skey
     };
     
-    let prompt = if is_raw_kernel { "请选择原始 Kernel 镜像" } else { "请选择要修补的 Boot 镜像" };
-    if let Some(boot_path) = ui::select_file(prompt, &["img"]) {
+    let maybe_path: Option<PathBuf> = if is_raw_kernel {
+        let prompt = "请选择原始 Kernel 镜像";
+        ui::select_file(prompt, &["img"])
+    } else {
+        println!("\n{} {}", ">>".cyan().bold(), "请选择镜像来源:".bright_white());
+        println!("{}", "=".repeat(60).white());
+        println!("{} 本地镜像", "1)".bright_cyan());
+        println!("{} 从 Payload/卡刷包 获取", "2)".bright_cyan());
+        println!("{}", "=".repeat(60).white());
+        print!("请选择 [1/2]: ");
+        let _ = io::stdout().flush();
+        let mut src_choice = String::new();
+        let _ = io::stdin().read_line(&mut src_choice);
+        let src_choice = src_choice.trim();
+
+        if src_choice == "2" {
+            ui::step(&format!("正在从 Payload 提取 {} 分区镜像...", target_partition));
+            let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else {
+                return;
+            };
+            let out_dir = Path::new("extracted_payload");
+            let _ = fs::create_dir_all(out_dir);
+            let reporter = Arc::new(ConsoleReporter::new());
+            let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+            match rua_core::payload::extract_single_partition(&payload_path, target_partition, out_dir, reporter_dyn).await {
+                Ok(p) => { reporter.print_summary(); Some(p) },
+                Err(e) => {
+                    if INTERRUPTED.load(Ordering::SeqCst) {
+                        reporter.clear_current(">> 已取消提取");
+                        ui::warn("已取消操作。");
+                    } else {
+                        ui::err(&format!("从 Payload 提取分区失败: {:?}", e));
+                    }
+                    None
+                }
+            }
+        } else {
+            let prompt = "请选择要修补的 Boot 镜像";
+            ui::select_file(prompt, &["img"])
+        }
+    };
+
+    if let Some(boot_path) = maybe_path {
         ui::step("正在使用 APatch 修补...");
         
         // 先修补，不自动刷入，以便后面询问
@@ -742,25 +995,119 @@ async fn flash_kernelsu_lkm(flasher: &Flasher) {
     }
     let selected_ver = &selected_branch.versions[ver_idx - 1];
 
-    // 3. 选择 Boot 镜像
-    let Some(boot_path) = ui::select_file("请选择要修补的 Boot 镜像", &["img"]) else {
-        return;
+    // 3. 先选择要修补的分区
+    let partition = select_partition();
+    if partition.is_empty() { return; }
+
+    // 4. 选择镜像来源（ramdisk 情况不提供 Payload 选项）
+    let mut payload_origin: Option<PathBuf> = None;
+    let img_path: PathBuf = if partition.eq_ignore_ascii_case("ramdisk") {
+        match ui::select_file("请选择要修补的镜像", &["img"]) {
+            Some(p) => p,
+            None => return,
+        }
+    } else {
+        println!("\n{} {}", ">>".cyan().bold(), "请选择镜像来源:".bright_white());
+        println!("{}", "=".repeat(60).white());
+        println!("{} 本地镜像", "1)".bright_cyan());
+        println!("{} 从 Payload/卡刷包 获取", "2)".bright_cyan());
+        println!("{}", "=".repeat(60).white());
+        print!("请选择 [1/2]: ");
+        let _ = io::stdout().flush();
+        let mut src_choice = String::new();
+        let _ = io::stdin().read_line(&mut src_choice);
+        let src_choice = src_choice.trim();
+
+        if src_choice == "2" {
+            ui::step(&format!("正在从 Payload 提取 {} 分区镜像...", partition));
+            let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else {
+                return;
+            };
+            payload_origin = Some(payload_path.clone());
+            let out_dir = Path::new("extracted_payload");
+            let _ = fs::create_dir_all(out_dir);
+            let reporter = Arc::new(ConsoleReporter::new());
+            let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+            match rua_core::payload::extract_single_partition(&payload_path, &partition, out_dir, reporter_dyn).await {
+                Ok(p) => { reporter.print_summary(); p },
+                Err(e) => {
+                    if INTERRUPTED.load(Ordering::SeqCst) {
+                        reporter.clear_current(">> 已取消提取");
+                        ui::warn("已取消操作。");
+                    } else {
+                        ui::err(&format!("从 Payload 提取分区失败: {:?}", e));
+                    }
+                    return;
+                }
+            }
+        } else {
+            match ui::select_file("请选择要修补的镜像", &["img"]) {
+                Some(p) => p,
+                None => return,
+            }
+        }
     };
 
-    // 4. 自动识别 KMI
-    ui::step("正在分析 Boot 镜像 KMI...");
-    let detected_kmi: Option<String> = match Flasher::detect_kmi_from_boot_img(&boot_path.to_string_lossy()) {
-        Ok(Some(kmi)) => {
-            ui::ok(&format!("检测到 KMI: {}", kmi));
-            Some(kmi)
+    // 5. 自动识别 KMI（分区差异化逻辑）
+    let mut detected_kmi: Option<String> = None;
+    if partition.eq_ignore_ascii_case("ramdisk") {
+        ui::warn("ramdisk 分区不支持自动检测 KMI，已跳过。");
+    } else if partition.eq_ignore_ascii_case("boot") {
+        ui::step("正在读取内核版本并判断 KMI...");
+        match Flasher::read_kernel_version_and_kmi_from_boot_img(&img_path.to_string_lossy()) {
+            Ok((kmi_opt, full_opt)) => {
+                if let Some(full) = full_opt {
+                    println!("- 内核版本字符串: {}", full);
+                }
+                if let Some(kmi) = kmi_opt {
+                    ui::ok(&format!("检测到 KMI: {}", kmi));
+                    detected_kmi = Some(kmi);
+                } else {
+                    ui::warn("无法根据内核版本字符串判断 KMI。");
+                }
+            }
+            Err(e) => ui::warn(&format!("读取内核版本失败: {:?}", e)),
         }
-        _ => {
-            ui::warn("无法从镜像中自动识别 KMI。");
-            None
+    } else if partition.eq_ignore_ascii_case("init_boot") {
+        if let Some(payload_path) = payload_origin.clone() {
+            ui::step("正在额外提取 boot 分区用于 KMI 检测...");
+            let out_dir = Path::new("extracted_payload");
+            let _ = fs::create_dir_all(out_dir);
+            let reporter = Arc::new(ConsoleReporter::new());
+            let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+            match rua_core::payload::extract_single_partition(&payload_path, "boot", out_dir, reporter_dyn).await {
+                Ok(boot_img) => {
+                    reporter.print_summary();
+                    match Flasher::read_kernel_version_and_kmi_from_boot_img(&boot_img.to_string_lossy()) {
+                        Ok((kmi_opt, full_opt)) => {
+                            if let Some(full) = full_opt {
+                                println!("- 内核版本字符串: {}", full);
+                            }
+                            if let Some(kmi) = kmi_opt {
+                                ui::ok(&format!("检测到 KMI: {}", kmi));
+                                detected_kmi = Some(kmi);
+                            } else {
+                                ui::warn("无法根据内核版本字符串判断 KMI。");
+                            }
+                        }
+                        Err(e) => ui::warn(&format!("读取内核版本失败: {:?}", e)),
+                    }
+                }
+                Err(e) => {
+                    if INTERRUPTED.load(Ordering::SeqCst) {
+                        reporter.clear_current(">> 已取消提取");
+                        ui::warn("已取消 KMI 检测。");
+                    } else {
+                        ui::warn(&format!("提取 boot 用于 KMI 检测失败: {:?}", e));
+                    }
+                }
+            }
+        } else {
+            ui::warn("init_boot 来源为本地镜像，无法自动提取 boot 进行 KMI 检测。");
         }
-    };
+    }
 
-    // 5. 选择 KMI (.ko 文件)
+    // 6. 选择 KMI (.ko 文件)
     println!("\n{} {}", ">>".cyan().bold(), "请选择匹配的 KMI (.ko):".bright_white());
     println!("{}", divider);
     
@@ -797,29 +1144,26 @@ async fn flash_kernelsu_lkm(flasher: &Flasher) {
     }
     let selected_ko = &selected_ver.ko_files[ko_idx - 1];
 
-    // 6. 执行修补
-    let partition = select_partition();
-    if partition.is_empty() { return; }
-
+    // 7. 执行修补
     ui::step("正在使用 KernelSU LKM 修补...");
-    match flasher.kernelsu_lkm_install(
-        &boot_path.to_string_lossy(),
+    match flasher.kernelsu_lkm_patch(
+        &img_path.to_string_lossy(),
         &selected_ver.ksuinit_path.to_string_lossy(),
         Some(&selected_ver.ksuinit_d_path.to_string_lossy()),
         &selected_ko.ko_path.to_string_lossy(),
         &partition,
         false
     ).await {
-        Ok(_) => {
+        Ok(out_name) => {
             ui::ok("KernelSU LKM 修补成功！");
-            
-            let out_name = format!("ksu_lkm_patched_{}.img", partition);
             println!("\n{}", "=".repeat(60).white());
             println!("{}", "📱 KernelSU LKM 刷入确认".bright_white().bold());
             println!("{}", "=".repeat(60).white());
             println!("{}", format!("  📦 分支: {}", selected_branch.name).cyan());
             println!("{}", format!("  🔢 版本: {}", selected_ver.version_name).cyan());
-            println!("{}", format!("  🔧 KMI: {}", selected_ko.kmi).cyan());
+            if let Some(kmi) = detected_kmi.as_ref() {
+                println!("{}", format!("  🔧 检测到 KMI: {}", kmi).cyan());
+            }
             println!("{}", format!("  💾 目标分区: {}", partition).cyan());
             println!("{}", format!("  📝 修补后镜像: {}", out_name).cyan());
             println!("{}", "=".repeat(60).white());
@@ -830,12 +1174,16 @@ async fn flash_kernelsu_lkm(flasher: &Flasher) {
                     ui::warn("未检测到设备，无法刷入。修补镜像已保存。");
                     return;
                 }
-
                 ui::step(&format!("正在刷入 {} 分区...", partition));
                 match flasher.flash_partition(&target_device, &partition, &out_name).await {
-                    Ok(_) => ui::ok("刷入成功！"),
+                    Ok(_) => {
+                        ui::ok("刷入成功！");
+                        let _ = std::fs::remove_file(&out_name);
+                    }
                     Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
                 }
+            } else {
+                println!("已取消刷入，修补镜像已保存为: {}", out_name);
             }
         }
         Err(e) => ui::err(&format!("KernelSU LKM 修补失败: {:?}", e)),
@@ -854,8 +1202,49 @@ async fn flash_anykernel3(flasher: &Flasher) {
     let target_partition = if is_raw_kernel { "kernel" } else { "boot" };
 
     if let Some(zip_path) = ui::select_file("请选择 AnyKernel3 ZIP 包", &["zip"]) {
-        let prompt = if is_raw_kernel { "请选择原始 Kernel 镜像" } else { "请选择原始 Boot 镜像" };
-        if let Some(boot_path) = ui::select_file(prompt, &["img"]) {
+        let maybe_boot: Option<PathBuf> = if is_raw_kernel {
+            let prompt = "请选择原始 Kernel 镜像";
+            ui::select_file(prompt, &["img"])
+        } else {
+            println!("\n{} {}", ">>".cyan().bold(), "请选择镜像来源:".bright_white());
+            println!("{}", "=".repeat(60).white());
+            println!("{} 本地镜像", "1)".bright_cyan());
+            println!("{} 从 Payload/卡刷包 获取", "2)".bright_cyan());
+            println!("{}", "=".repeat(60).white());
+            print!("请选择 [1/2]: ");
+            let _ = io::stdout().flush();
+            let mut src_choice = String::new();
+            let _ = io::stdin().read_line(&mut src_choice);
+            let src_choice = src_choice.trim();
+
+            if src_choice == "2" {
+                ui::step(&format!("正在从 Payload 提取 {} 分区镜像...", target_partition));
+                let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else {
+                    return;
+                };
+                let out_dir = Path::new("extracted_payload");
+                let _ = fs::create_dir_all(out_dir);
+                let reporter = Arc::new(ConsoleReporter::new());
+                let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+                match rua_core::payload::extract_single_partition(&payload_path, target_partition, out_dir, reporter_dyn).await {
+                    Ok(p) => { reporter.print_summary(); Some(p) },
+                    Err(e) => {
+                        if INTERRUPTED.load(Ordering::SeqCst) {
+                            reporter.clear_current(">> 已取消提取");
+                            ui::warn("已取消操作。");
+                        } else {
+                            ui::err(&format!("从 Payload 提取分区失败: {:?}", e));
+                        }
+                        None
+                    }
+                }
+            } else {
+                let prompt = "请选择原始 Boot 镜像";
+                ui::select_file(prompt, &["img"])
+            }
+        };
+
+        if let Some(boot_path) = maybe_boot {
             ui::step("正在解压 AnyKernel3 并修补内核...");
             match flasher.anykernel3_root(&zip_path.to_string_lossy(), &boot_path.to_string_lossy(), target_partition, is_raw_kernel, false).await {
                 Ok(out_name) => {
@@ -867,13 +1256,18 @@ async fn flash_anykernel3(flasher: &Flasher) {
                     let _ = io::stdin().read_line(&mut confirm);
                     let confirm = confirm.trim().to_lowercase();
                     if confirm.is_empty() || confirm == "y" {
+                        let target_device = select_device(&flasher.client).await;
+                        if target_device.is_empty() {
+                            ui::warn("未检测到设备，无法刷入。修补镜像已保存。");
+                            return;
+                        }
                         ui::step(&format!("正在刷入到 {} 分区...", target_partition));
-                        match flasher.client.run(&["flash", target_partition, &out_name]).await {
-                            Ok(true) => {
+                        match flasher.flash_partition(&target_device, target_partition, &out_name).await {
+                            Ok(_) => {
                                 ui::ok("刷入成功！");
                                 let _ = std::fs::remove_file(&out_name);
                             }
-                            _ => ui::err("刷入失败，请检查 fastboot 连接"),
+                            Err(_) => ui::err("刷入失败，请检查 fastboot 连接"),
                         }
                     } else {
                         println!("已取消刷入，修补镜像已保存为: {}", out_name);
@@ -887,22 +1281,59 @@ async fn flash_anykernel3(flasher: &Flasher) {
 }
 
 async fn flash_custom_partition(flasher: &Flasher) {
-    if ui::confirm("确定要继续吗？此操作将刷入自定义分区镜像。", true) {
-        if let Some(path) = ui::select_file("请选择要刷入的自定义分区镜像", &["img"]) {
-            print!("请输入分区名 (如 recovery/system/vendor): ");
-            let _ = io::stdout().flush();
-            let mut partition = String::new();
-            let _ = io::stdin().read_line(&mut partition);
-            let partition = partition.trim();
-            
-            if !partition.is_empty() {
-                ui::step(&format!("正在刷入 {}: {} ...", partition, path.display()));
-                match flasher.flash_partition("", partition, &path.to_string_lossy()).await {
-                    Ok(_) => ui::ok("刷入成功！"),
-                    Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
+    if !ui::confirm("确定要继续吗？此操作将刷入自定义分区镜像。", true) { return; }
+
+    print!("请输入分区名 (如 boot/init_boot/recovery/system/vendor): ");
+    let _ = io::stdout().flush();
+    let mut partition = String::new();
+    let _ = io::stdin().read_line(&mut partition);
+    let partition = partition.trim().to_string();
+    if partition.is_empty() { ui::err("分区名不能为空。"); return; }
+
+    println!("\n{} {}", ">>".cyan().bold(), "请选择镜像来源:".bright_white());
+    println!("{}", "=".repeat(60).white());
+    println!("{} 本地镜像", "1)".bright_cyan());
+    println!("{} 从 Payload/卡刷包 获取", "2)".bright_cyan());
+    println!("{}", "=".repeat(60).white());
+    print!("请选择 [1/2]: ");
+    let _ = io::stdout().flush();
+    let mut src_choice = String::new();
+    let _ = io::stdin().read_line(&mut src_choice);
+    let src_choice = src_choice.trim();
+
+    let img_path: Option<PathBuf> = if src_choice == "2" {
+        ui::step(&format!("正在从 Payload 提取 {} 分区镜像...", partition));
+        let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else { return; };
+        let out_dir = Path::new("extracted_payload");
+        let _ = fs::create_dir_all(out_dir);
+        let reporter = Arc::new(ConsoleReporter::new());
+        let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+        match rua_core::payload::extract_single_partition(&payload_path, &partition, out_dir, reporter_dyn).await {
+            Ok(p) => { reporter.print_summary(); Some(p) },
+            Err(e) => {
+                if INTERRUPTED.load(Ordering::SeqCst) {
+                    reporter.clear_current(">> 已取消提取");
+                    ui::warn("已取消操作。");
+                } else {
+                    ui::err(&format!("从 Payload 提取分区失败: {:?}", e));
                 }
+                None
             }
         }
+    } else {
+        ui::select_file("请选择要刷入的自定义分区镜像", &["img"])
+    };
+
+    let Some(path) = img_path else { return; };
+    let target_device = select_device(&flasher.client).await;
+    if target_device.is_empty() {
+        ui::warn("未检测到设备，取消刷入。");
+        return;
+    }
+    ui::step(&format!("正在刷入 {}: {} ...", partition, path.display()));
+    match flasher.flash_partition(&target_device, &partition, &path.to_string_lossy()).await {
+        Ok(_) => ui::ok("刷入成功！"),
+        Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
     }
 }
 
@@ -917,13 +1348,52 @@ fn install_usb_driver() {
 }
 
 async fn disable_avb(flasher: &Flasher) {
-    if let Some(vbmeta_path) = ui::select_file("请选择 vbmeta.img", &["img"]) {
-        ui::step("正在刷入 vbmeta.img 并关闭 AVB 校验...");
-        if let Err(e) = flasher.flash_partition("", "vbmeta", &vbmeta_path.to_string_lossy()).await {
-            ui::err(&format!("vbmeta 刷入失败: {:?}", e));
-        } else {
-            ui::ok("vbmeta 刷入成功，AVB 校验已禁用。");
+    println!("\n{} {}", ">>".cyan().bold(), "请选择 vbmeta 镜像来源:".bright_white());
+    println!("{}", "=".repeat(60).white());
+    println!("{} 本地 vbmeta.img", "1)".bright_cyan());
+    println!("{} 从 Payload/卡刷包 提取 vbmeta", "2)".bright_cyan());
+    println!("{}", "=".repeat(60).white());
+    print!("请选择 [1/2]: ");
+    let _ = io::stdout().flush();
+    let mut src_choice = String::new();
+    let _ = io::stdin().read_line(&mut src_choice);
+    let src_choice = src_choice.trim();
+
+    let img_path: Option<PathBuf> = if src_choice == "2" {
+        ui::step("正在从 Payload 提取 vbmeta 分区镜像...");
+        let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else { return; };
+        let out_dir = Path::new("extracted_payload");
+        let _ = fs::create_dir_all(out_dir);
+        let reporter = Arc::new(ConsoleReporter::new());
+        let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+        match rua_core::payload::extract_single_partition(&payload_path, "vbmeta", out_dir, reporter_dyn).await {
+            Ok(p) => { reporter.print_summary(); Some(p) },
+            Err(e) => {
+                if INTERRUPTED.load(Ordering::SeqCst) {
+                    reporter.clear_current(">> 已取消提取");
+                    ui::warn("已取消操作。");
+                } else {
+                    ui::err(&format!("从 Payload 提取 vbmeta 失败: {:?}", e));
+                }
+                None
+            }
         }
+    } else {
+        ui::select_file("请选择 vbmeta.img", &["img"])
+    };
+
+    let Some(vbmeta_path) = img_path else { return; };
+
+    let target_device = select_device(&flasher.client).await;
+    if target_device.is_empty() {
+        ui::err("未检测到 Fastboot 设备，无法执行刷入。");
+        return;
+    }
+
+    ui::step("正在刷入 vbmeta.img 并关闭 AVB 校验...");
+    match flasher.flash_partition(&target_device, "vbmeta", &vbmeta_path.to_string_lossy()).await {
+        Ok(_) => ui::ok("vbmeta 刷入成功，AVB 校验已禁用。"),
+        Err(e) => ui::err(&format!("vbmeta 刷入失败: {:?}", e)),
     }
 }
 

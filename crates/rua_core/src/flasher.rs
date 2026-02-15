@@ -117,6 +117,49 @@ impl Flasher {
         Ok(None)
     }
 
+    pub fn read_kernel_version_and_kmi_from_boot_img(boot_img_path: &str) -> Result<(Option<String>, Option<String>)> {
+        let mut boot_data = Vec::new();
+        File::open(boot_img_path)?.read_to_end(&mut boot_data)?;
+        let boot_img = BootImage::parse(&boot_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
+        if let Some(kernel) = boot_img.get_blocks().get_kernel() {
+            let data = kernel.get_data();
+            let mut printable_strings: Vec<String> = Vec::new();
+            let mut buf: Vec<u8> = Vec::new();
+            for &b in data {
+                if (0x20..=0x7e).contains(&b) {
+                    buf.push(b);
+                } else {
+                    if buf.len() >= 6 {
+                        if let Ok(s) = String::from_utf8(buf.clone()) {
+                            printable_strings.push(s);
+                        }
+                    }
+                    buf.clear();
+                }
+            }
+            if buf.len() >= 6 {
+                if let Ok(s) = String::from_utf8(buf.clone()) {
+                    printable_strings.push(s);
+                }
+            }
+            let re = regex::Regex::new(r"(?i)(\d+\.\d+)[^\n\r]*?(android(\d{2}))").ok();
+            if let Some(re) = re {
+                for s in printable_strings {
+                    if let Some(caps) = re.captures(&s) {
+                        let kver = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                        let android = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let kmi = if !kver.is_empty() && !android.is_empty() {
+                            Some(format!("{}-{}", android.to_lowercase(), kver))
+                        } else { None };
+                        return Ok((kmi, Some(s)));
+                    }
+                }
+            }
+            return Ok((None, None));
+        }
+        Ok((None, None))
+    }
+
     fn is_magisk_patched(entries: &[(String, u32, Vec<u8>)]) -> bool {
         entries.iter().any(|(name, _, _)| name == ".backup/.magisk")
     }
@@ -134,6 +177,25 @@ impl Flasher {
         target_partition: &str,
         force: bool
     ) -> Result<()> {
+        let out_name = self.kernelsu_lkm_patch(boot_img_path, ksuinit_path, ksuinit_d_dir, ko_path, target_partition, force).await?;
+        let res = self.client.run(&["flash", target_partition, &out_name]).await;
+        let _ = fs::remove_file(&out_name);
+        if res? {
+            Ok(())
+        } else {
+            Err(FlashError::FastbootError("Failed to flash patched KSU image".into()))
+        }
+    }
+
+    pub async fn kernelsu_lkm_patch(
+        &self,
+        boot_img_path: &str,
+        ksuinit_path: &str,
+        ksuinit_d_dir: Option<&str>,
+        ko_path: &str,
+        target_partition: &str,
+        force: bool
+    ) -> Result<String> {
         let mut boot_data = Vec::new();
         File::open(boot_img_path)?.read_to_end(&mut boot_data)?;
         let boot_img = BootImage::parse(&boot_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
@@ -150,19 +212,26 @@ impl Flasher {
         let fmt = utils::detect_ramdisk_format(rd_raw);
         let rd_decomp = utils::decompress_ramdisk(rd_raw)?;
 
-        let (mut entries, old_init_info) = if rd_decomp.is_empty() {
+        let mut rd_cpio = rd_decomp.clone();
+        let cpio_start = detect_and_skip_cpio_header(&rd_cpio);
+        if cpio_start > 0 {
+            let sliced = &rd_cpio[cpio_start..];
+            rd_cpio = sliced.to_vec();
+        }
+
+        let (mut entries, old_init_info) = if rd_cpio.is_empty() {
             (Vec::new(), None)
         } else {
-            utils::cpio_load_with_threecpio(&rd_decomp)?
+            utils::cpio_load_with_threecpio(&rd_cpio)?
         };
 
         if Self::is_magisk_patched(&entries) {
-            if force {
-                println!("- 警告: 检测到 Magisk 已修补此镜像，将继续安装（可能导致冲突）");
-            } else {
-                return Err(FlashError::PatchError(
-                    "检测到 Magisk 已修补此镜像，KernelSU 可能与 Magisk 冲突。\n如需强制安装，请使用 --force 参数。".to_string()
-                ));
+            println!("- 警告: 检测到此镜像已由 Magisk 修补，继续可能导致冲突");
+            if !force {
+                let proceed = Self::prompt_yes_no("是否继续安装 KernelSU？[y/N]: ", false);
+                if !proceed {
+                    return Err(FlashError::PatchError("用户取消".into()));
+                }
             }
         }
 
@@ -180,7 +249,7 @@ impl Flasher {
         entries.push(("init".to_string(), 0o755, ksuinit_bytes));
         
         let ko_bytes = fs::read(ko_path)?;
-        entries.push(("kernelsu.ko".to_string(), 0o755, ko_bytes));
+        entries.push(("lib/modules/kernelsu.ko".to_string(), 0o755, ko_bytes));
         
         if let Some(dir) = ksuinit_d_dir {
             let base = Path::new(dir);
@@ -190,13 +259,29 @@ impl Flasher {
                     let p = entry.path();
                     if p.is_file() {
                         if let Some(file_name) = p.file_name().and_then(|s| s.to_str()) {
-                            let target = format!("ksuinit.d/{}", file_name);
+                            let target = format!("etc/ksuinit.d/{}", file_name);
                             let content = fs::read(&p)?;
                             entries.push((target, 0o755, content));
                         }
                     }
                 }
             }
+        }
+        
+        if let Some(sep) = crate::sepolicy::extract_sepolicy(&rd_cpio) {
+            match crate::sepolicy::Sepolicy::parse(&sep) {
+                Ok(mut s) => {
+                    s.add_magisk_rules();
+                    entries.push(("sepolicy".to_string(), 0o644, s.data));
+                    println!("- 已注入 SELinux 规则（KernelSU 路径）");
+                }
+                Err(_) => {
+                    entries.push(("sepolicy".to_string(), 0o644, sep));
+                    println!("- 已写入原始 sepolicy（KernelSU 路径）");
+                }
+            }
+        } else {
+            println!("- 未找到 sepolicy，跳过（KernelSU 路径）");
         }
         
         let new_cpio = utils::cpio_create_with_threecpio(&entries)?;
@@ -208,15 +293,7 @@ impl Flasher {
         
         let out_name = format!("ksu_lkm_patched_{}.img", target_partition);
         fs::write(&out_name, output_data.into_inner())?;
-        
-        let res = self.client.run(&["flash", target_partition, &out_name]).await;
-        let _ = fs::remove_file(&out_name);
-        
-        if res? {
-            Ok(())
-        } else {
-            Err(FlashError::FastbootError("Failed to flash patched KSU image".into()))
-        }
+        Ok(out_name)
     }
 
     pub async fn apatch_patch(&self, boot_img_path: &str, skey: &str, target_partition: &str, is_raw_kernel: bool, auto_flash: bool) -> Result<()> {
@@ -520,10 +597,12 @@ impl Flasher {
 
         println!("{}", ">> 正在解压 Ramdisk...".cyan().bold());
         let mut ramdisk_data = Vec::new();
+        let mut ramdisk_fmt = utils::RamdiskFormat::Uncompressed;
         if let Some(rd) = boot_img.get_blocks().get_ramdisk() {
             let raw_rd = rd.get_data();
             println!("{}", format!(">> 原始 Ramdisk 大小: {} bytes", raw_rd.len()).green());
             println!("{}", format!(">> Ramdisk 魔数: {:02x?}", &raw_rd[0..std::cmp::min(16, raw_rd.len())]).yellow());
+            ramdisk_fmt = utils::detect_ramdisk_format(raw_rd);
 
             let magic_u32 = if raw_rd.len() >= 4 {
                 Some(u32::from_le_bytes([raw_rd[0], raw_rd[1], raw_rd[2], raw_rd[3]]))
@@ -568,22 +647,28 @@ impl Flasher {
             println!("{}", ">> No Ramdisk data found".yellow());
         }
 
-        let (mut entries, _) = if ramdisk_data.is_empty() {
+        let (mut entries, old_init_info) = if ramdisk_data.is_empty() {
             (Vec::new(), None)
         } else {
             utils::cpio_load_with_threecpio(&ramdisk_data)?
         };
         
-        Self::patch_ramdisk_entries(&mut entries, &magiskinit, &magiskbin, &stub, &init_ld, &sha1_sum, &ramdisk_data)?;
+        if Self::is_magisk_patched(&entries) {
+            println!("{}", ">> 警告: 检测到镜像已包含 Magisk 修补".yellow());
+            let proceed = Self::prompt_yes_no("是否在已修补基础上继续？[y/N]: ", false);
+            if !proceed {
+                return Err(FlashError::PatchError("用户取消".into()));
+            }
+        }
+        
+        Self::patch_ramdisk_entries(&mut entries, old_init_info.as_ref(), &magiskinit, &magiskbin, &stub, &init_ld, &sha1_sum, &ramdisk_data)?;
 
         println!("{}", ">> 正在重新打包 Ramdisk (CPIO)...".cyan().bold());
         let new_cpio_data = utils::cpio_create_with_threecpio(&entries)?;
         println!("{}", format!(">> CPIO 包大小: {} bytes", new_cpio_data.len()).green());
 
-        println!("{}", ">> 正在压缩 Ramdisk (GZip)...".cyan().bold());
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&new_cpio_data)?;
-        let final_ramdisk = encoder.finish()?;
+        println!("{}", ">> 正在压缩 Ramdisk (保持原格式)...".cyan().bold());
+        let final_ramdisk = utils::compress_ramdisk(ramdisk_fmt, &new_cpio_data)?;
         println!("{}", format!(">> 最终 Ramdisk 大小: {} bytes", final_ramdisk.len()).green());
 
         if is_init_boot {
@@ -621,6 +706,17 @@ impl Flasher {
             let mut patcher = BootImagePatchOption::new(&boot_img);
             patcher.replace_ramdisk(Box::new(Cursor::new(final_ramdisk)), true);
 
+            if let Some(kernel) = boot_img.get_blocks().get_kernel() {
+                let kernel_bytes = kernel.get_data();
+                let patched_kernel = Self::hex_patch_kernel_skip_initramfs(kernel_bytes);
+                if let Some(pbytes) = patched_kernel {
+                    println!("{}", ">> 已对内核应用 skip_initramfs→want_initramfs 补丁".green());
+                    patcher.replace_kernel(Box::new(Cursor::new(pbytes)), false);
+                } else {
+                    println!("{}", ">> 未找到可替换的 skip_initramfs，跳过内核十六进制补丁".yellow());
+                }
+            }
+
             let mut output_data = Cursor::new(Vec::new());
             patcher.patch(&mut output_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
             let patched_image = output_data.into_inner();
@@ -649,6 +745,7 @@ impl Flasher {
 
     fn patch_ramdisk_entries(
         entries: &mut Vec<(String, u32, Vec<u8>)>,
+        old_init_info: Option<&(usize, Vec<u8>)>,
         magiskinit: &[u8],
         magiskbin: &[u8],
         stub: &[u8],
@@ -657,6 +754,9 @@ impl Flasher {
         ramdisk_data: &[u8]
     ) -> Result<()> {
         entries.retain(|(name, _, _)| name != "init");
+        if let Some((mode, old)) = old_init_info {
+            entries.push(("init.real".to_string(), *mode as u32, old.clone()));
+        }
         entries.push(("init".to_string(), 0o750, magiskinit.to_vec()));
         println!("{}", ">> 已替换 init 为 Magiskinit".green());
 
@@ -709,6 +809,44 @@ impl Flasher {
         }
 
         Ok(())
+    }
+
+    fn hex_patch_kernel_skip_initramfs(kernel: &[u8]) -> Option<Vec<u8>> {
+        let from = b"skip_initramfs";
+        let to = b"want_initramfs";
+        if from.len() != to.len() {
+            return None;
+        }
+        let mut data = kernel.to_vec();
+        let mut patched = false;
+        let mut i = 0usize;
+        while i + from.len() <= data.len() {
+            if &data[i..i + from.len()] == from {
+                for j in 0..from.len() {
+                    data[i + j] = to[j];
+                }
+                patched = true;
+                i += from.len();
+            } else {
+                i += 1;
+            }
+        }
+        if patched { Some(data) } else { None }
+    }
+
+    fn prompt_yes_no(question: &str, default_yes: bool) -> bool {
+        let suffix = if default_yes { " [Y/n]: " } else { " [y/N]: " };
+        print!("{}{}", question, "");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            return default_yes;
+        }
+        let ans = input.trim().to_lowercase();
+        if ans.is_empty() {
+            return default_yes;
+        }
+        ans == "y" || ans == "yes"
     }
 
     pub async fn is_in_fastbootd_mode(&self) -> Result<bool> {

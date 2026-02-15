@@ -32,3 +32,4 @@ tokio-util = { version = "0.7", features = ["rt"] }
 scopeguard = "1.2.0"
 tracing = "0.1"
 regex = "1.10"
+payload_dumper = { version = "0.8", features = ["remote_zip"] }

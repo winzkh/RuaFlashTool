@@ -2794,6 +2794,7 @@ dependencies = [
  "lz4_flex 0.11.5",
  "lzma-rs",
  "num_cpus",
+ "payload_dumper",
  "regex",
  "scopeguard",
  "serde",

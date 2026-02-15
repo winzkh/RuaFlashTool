@@ -1,14 +1,12 @@
 use tokio::process::Command;
 use std::path::PathBuf;
 use std::env;
-use colored::*;
 use crate::error::{FlashError, Result};
 use crate::device::{ConnectedDevice, DeviceMode};
 
 #[derive(Clone)]
 pub struct AdbClient {
     adb_path: PathBuf,
-    pub debug: bool,
     pub selected_serial: Option<String>,
 }
 
@@ -38,13 +36,8 @@ impl AdbClient {
 
         Ok(Self {
             adb_path,
-            debug: false,
             selected_serial: None,
         })
-    }
-
-    pub fn set_debug(&mut self, debug: bool) {
-        self.debug = debug;
     }
 
     pub fn set_serial(&mut self, serial: Option<String>) {
@@ -69,11 +62,6 @@ impl AdbClient {
 
     pub async fn run(&self, args: &[&str]) -> Result<bool> {
         let cmd_args = self.build_args(args);
-        if self.debug {
-            let cmd_name = self.adb_path.file_name().and_then(|f| f.to_str()).unwrap_or("adb");
-            println!("\n{} [模拟] 执行: {} {}", ">>".yellow(), cmd_name, cmd_args.join(" "));
-            return Ok(true);
-        }
         let status = Command::new(&self.adb_path)
             .args(&cmd_args)
             .status()
@@ -83,17 +71,6 @@ impl AdbClient {
 
     pub async fn capture(&self, args: &[&str]) -> Result<String> {
         let cmd_args = self.build_args(args);
-        if self.debug {
-            let cmd_name = self.adb_path.file_name().and_then(|f| f.to_str()).unwrap_or("adb");
-            println!("\n{} [模拟] 捕获输出: {} {}", ">>".yellow(), cmd_name, cmd_args.join(" "));
-            if cmd_args.contains(&"devices".to_string()) {
-                return Ok("List of devices attached\nEMULATOR12345\tdevice".to_string());
-            }
-            if cmd_args.contains(&"getprop".to_string()) {
-                return Ok("EMULATOR_MODEL".to_string());
-            }
-            return Ok("".to_string());
-        }
         let output = Command::new(&self.adb_path)
             .args(&cmd_args)
             .output()
@@ -176,12 +153,6 @@ impl AdbClient {
         }
         args.push("--window-title");
         args.push(&title);
-
-        if self.debug {
-            let cmd_name = exe.file_name().and_then(|f| f.to_str()).unwrap_or("scrcpy");
-            println!("\n{} [模拟] 执行: {} {}", ">>".yellow(), cmd_name, args.join(" "));
-            return Ok(true);
-        }
 
         let status = Command::new(exe)
             .args(&args)
