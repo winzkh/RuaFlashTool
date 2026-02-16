@@ -8,6 +8,8 @@ pub mod sepolicy;
 pub mod constants;
 pub mod utils;
 pub mod payload;
+pub mod bootimg;
+pub mod avb;
 
 pub use error::{FlashError, Result};
 pub use device::{DeviceMode, ConnectedDevice};

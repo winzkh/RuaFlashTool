@@ -296,7 +296,7 @@ async fn handle_menu_action(choice: &str, client: &FastbootClient) {
         "18" => factory_reset(client).await,
         "19" => reboot_device(client).await,
         "20" => switch_slot(client).await,
-        "21" => activate_shizuku().await,
+        "21" => activate_adb_menu().await,
         "22" => open_device_manager(),
         "0" => ui::ok("感谢使用 RuaFlashTool，再见！"),
         _ => ui::warn(&format!("未知选项: {}", choice)),
@@ -364,14 +364,35 @@ async fn flash_xiaomi_fastboot() {
                 }
 
                 if should_proceed {
+                    ui::step("正在检测 Fastboot 设备...");
+                    let serial = match FastbootClient::new() {
+                        Ok(client) => {
+                            let s = select_device(&client).await;
+                            if s.is_empty() {
+                                ui::warn("未选择设备，取消刷机。");
+                                return;
+                            }
+                            s
+                        }
+                        Err(e) => {
+                            ui::err(&format!("初始化 Fastboot 客户端失败: {:?}", e));
+                            return;
+                        }
+                    };
+                    ui::step(&format!("已选择设备: {}", serial));
+
                     ui::step(&format!("正在启动 {} ...", selected_bat));
+                    // 使用 start "" /wait "<bat>" -s <serial>，把序列号透传给脚本中的 fastboot %*
                     let _ = tokio::process::Command::new("cmd")
                         .arg("/c")
                         .arg("start")
+                        .arg("")
                         .arg("/wait")
                         .arg(&bat_path)
+                        .arg("-s")
+                        .arg(&serial)
                         .spawn();
-                    ui::ok("刷机脚本已启动，请在手机屏幕上确认操作。");
+                    ui::ok("刷机脚本已启动，并已指定目标设备序列号。");
                 }
             } else {
                 ui::err("无效的选择。");
@@ -566,26 +587,94 @@ async fn manage_bootloader(client: &FastbootClient) {
     match choice.trim() {
         "1" => {
             if ui::confirm("确定要解锁 Bootloader 吗？这将清除所有数据！", false) {
+                println!("\n要使用的解锁方式？");
+                println!("1. fastboot flashing unlock (通用命令)");
+                println!("2. fastboot oem unlock (部分华为设备等)");
+                println!("3. fastboot flash unlock (部分 Nexus 和其他机型)");
+                print!("请选择 (1-3, 默认 1): ");
+                let _ = io::stdout().flush();
+                let mut m = String::new();
+                let _ = io::stdin().read_line(&mut m);
+                let method = m.trim();
+
                 ui::step("正在尝试解锁 Bootloader...");
-                if let Err(e) = client.run(&["flashing", "unlock"]).await {
-                    ui::err(&format!("指令执行失败: {:?}", e));
+                match method {
+                    "2" => {
+                        if let Err(e) = client.run(&["oem", "unlock"]).await {
+                            ui::err(&format!("指令执行失败: {:?}", e));
+                        } else {
+                            ui::ok("已发送解锁指令，请查看手机屏幕确认。");
+                        }
+                    }
+                    "3" => {
+                        if let Some(f) = ui::select_file("请选择 unlock 文件（可跳过）", &["bin","img","txt","dat"]) {
+                            if let Err(e) = client.run(&["flash", "unlock", &f.to_string_lossy()]).await {
+                                ui::err(&format!("指令执行失败: {:?}", e));
+                            } else {
+                                ui::ok("已发送解锁指令，请查看手机屏幕确认。");
+                            }
+                        } else {
+                            if let Err(e) = client.run(&["flash", "unlock"]).await {
+                                ui::err(&format!("指令执行失败: {:?}", e));
+                            } else {
+                                ui::ok("已发送解锁指令，请查看手机屏幕确认。");
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Err(e) = client.run(&["flashing", "unlock"]).await {
+                            ui::err(&format!("指令执行失败: {:?}", e));
+                        } else {
+                            ui::ok("已发送解锁指令，请查看手机屏幕确认。");
+                        }
+                    }
                 }
-                if let Err(e) = client.run(&["oem", "unlock"]).await {
-                    ui::err(&format!("指令执行失败: {:?}", e));
-                }
-                ui::ok("已发送解锁指令，请查看手机屏幕确认。");
             }
         }
         "2" => {
             if ui::confirm("确定要回锁 Bootloader 吗？请确保系统为原厂且未修改！", false) {
+                println!("\n要使用的回锁方式？");
+                println!("1. fastboot flashing lock (通用命令)");
+                println!("2. fastboot oem lock (部分设备)");
+                println!("3. fastboot flash lock (部分机型)");
+                print!("请选择 (1-3, 默认 1): ");
+                let _ = io::stdout().flush();
+                let mut m = String::new();
+                let _ = io::stdin().read_line(&mut m);
+                let method = m.trim();
+
                 ui::step("正在尝试回锁 Bootloader...");
-                if let Err(e) = client.run(&["flashing", "lock"]).await {
-                    ui::err(&format!("指令执行失败: {:?}", e));
+                match method {
+                    "2" => {
+                        if let Err(e) = client.run(&["oem", "lock"]).await {
+                            ui::err(&format!("指令执行失败: {:?}", e));
+                        } else {
+                            ui::ok("已发送回锁指令，请查看手机屏幕确认。");
+                        }
+                    }
+                    "3" => {
+                        if let Some(f) = ui::select_file("请选择 lock 文件（可跳过）", &["bin","img","txt","dat"]) {
+                            if let Err(e) = client.run(&["flash", "lock", &f.to_string_lossy()]).await {
+                                ui::err(&format!("指令执行失败: {:?}", e));
+                            } else {
+                                ui::ok("已发送回锁指令，请查看手机屏幕确认。");
+                            }
+                        } else {
+                            if let Err(e) = client.run(&["flash", "lock"]).await {
+                                ui::err(&format!("指令执行失败: {:?}", e));
+                            } else {
+                                ui::ok("已发送回锁指令，请查看手机屏幕确认。");
+                            }
+                        }
+                    }
+                    _ => {
+                        if let Err(e) = client.run(&["flashing", "lock"]).await {
+                            ui::err(&format!("指令执行失败: {:?}", e));
+                        } else {
+                            ui::ok("已发送回锁指令，请查看手机屏幕确认。");
+                        }
+                    }
                 }
-                if let Err(e) = client.run(&["oem", "lock"]).await {
-                    ui::err(&format!("指令执行失败: {:?}", e));
-                }
-                ui::ok("已发送回锁指令，请查看手机屏幕确认。");
             }
         }
         _ => ui::err("无效的选择。"),
@@ -759,6 +848,32 @@ async fn flash_magisk(flasher: &Flasher) {
                     println!("{}", format!("  📝 修补后镜像: {}", patched_path).cyan());
                     println!("{}", "=".repeat(60).white());
 
+                    let mut final_image_path = patched_path.clone();
+                    print!("是否对修补后镜像进行 AVB 签名？[y/N]: ");
+                    let _ = io::stdout().flush();
+                    let mut sign_ans = String::new();
+                    let _ = io::stdin().read_line(&mut sign_ans);
+                    let sign_ans = sign_ans.trim().to_lowercase();
+                    if sign_ans == "y" || sign_ans == "yes" {
+                        match select_avb_key_dir_and_file(exe_dir) {
+                            Some((_key_dir, key_path)) => {
+                                ui::step(&format!("将使用密钥: {}", key_path.display()));
+                                match try_sign_with_external_tools(&flasher.client, None, &final_image_path, &partition, &key_path).await {
+                                    Ok(signed_path) => {
+                                        ui::ok(&format!("签名成功: {}", signed_path));
+                                        final_image_path = signed_path;
+                                    }
+                                    Err(e) => {
+                                        ui::warn(&format!("签名失败或未找到可用工具: {}", e));
+                                    }
+                                }
+                            }
+                            None => {
+                                ui::warn(&format!("未在 {} 下找到可用密钥或用户取消，跳过签名。", key_dir_fallback(exe_dir).display()));
+                            }
+                        }
+                    }
+
                     if !ui::confirm("确定要继续刷入吗？", true) {
                         ui::warn("已取消刷入操作，修补镜像已保存。");
                         return;
@@ -771,7 +886,7 @@ async fn flash_magisk(flasher: &Flasher) {
                     }
 
                     ui::step(&format!("正在刷入 {} 分区...", partition));
-                    match flasher.flash_partition(&target_device, &partition, &patched_path).await {
+                    match flasher.flash_partition(&target_device, &partition, &final_image_path).await {
                         Ok(_) => ui::ok("刷入成功！"),
                         Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
                     }
@@ -788,8 +903,44 @@ async fn flash_magisk(flasher: &Flasher) {
                 return;
             }
 
-            let Some(boot_path) = ui::select_file("请选择要修补的 Boot 镜像", &["img"]) else {
-                return;
+            // 与分支逻辑保持一致：支持从本地或 Payload/卡刷包中获取镜像
+            println!("\n{} {}", ">>".cyan().bold(), "请选择镜像来源:".bright_white());
+            println!("{}", "=".repeat(60).white());
+            println!("{} 本地镜像", "1)".bright_cyan());
+            println!("{} 从 Payload/卡刷包 获取", "2)".bright_cyan());
+            println!("{}", "=".repeat(60).white());
+            print!("请选择 [1/2]: ");
+            let _ = io::stdout().flush();
+            let mut src_choice = String::new();
+            let _ = io::stdin().read_line(&mut src_choice);
+            let src_choice = src_choice.trim();
+
+            let boot_path: PathBuf = if src_choice == "2" {
+                ui::step(&format!("正在从 Payload 提取 {} 分区镜像...", partition));
+                let Some(payload_path) = ui::select_file("请选择 Payload.bin 或卡刷包 ZIP", &["bin", "zip"]) else {
+                    return;
+                };
+                let out_dir = Path::new("extracted_payload");
+                let _ = fs::create_dir_all(out_dir);
+                let reporter = Arc::new(ConsoleReporter::new());
+                let reporter_dyn: Arc<dyn ProgressReporter> = reporter.clone();
+                match rua_core::payload::extract_single_partition(&payload_path, &partition, out_dir, reporter_dyn).await {
+                    Ok(p) => { reporter.print_summary(); p },
+                    Err(e) => {
+                        if INTERRUPTED.load(Ordering::SeqCst) {
+                            reporter.clear_current(">> 已取消提取");
+                            ui::warn("已取消操作。");
+                        } else {
+                            ui::err(&format!("从 Payload 提取分区失败: {:?}", e));
+                        }
+                        return;
+                    }
+                }
+            } else {
+                match ui::select_file("请选择要修补的 Boot 镜像", &["img"]) {
+                    Some(p) => p,
+                    None => return,
+                }
             };
 
             let boot_path_str = boot_path.to_string_lossy().to_string();
@@ -808,6 +959,28 @@ async fn flash_magisk(flasher: &Flasher) {
                     println!("{}", format!("  📝 修补后镜像: {}", patched_path).cyan());
                     println!("{}", "=".repeat(60).white());
 
+                    let mut final_image_path = patched_path.clone();
+                    print!("是否对修补后镜像进行 AVB 签名？[y/N]: ");
+                    let _ = io::stdout().flush();
+                    let mut sign_ans = String::new();
+                    let _ = io::stdin().read_line(&mut sign_ans);
+                    let sign_ans = sign_ans.trim().to_lowercase();
+                    if sign_ans == "y" || sign_ans == "yes" {
+                        match select_avb_key_dir_and_file(exe_dir) {
+                            Some((_dir, key_path)) => {
+                                ui::step(&format!("将使用密钥: {}", key_path.display()));
+                                match try_sign_with_external_tools(&flasher.client, None, &final_image_path, &partition, &key_path).await {
+                                    Ok(signed_path) => {
+                                        ui::ok(&format!("签名成功: {}", signed_path));
+                                        final_image_path = signed_path;
+                                    }
+                                    Err(e) => ui::warn(&format!("签名失败或未找到可用工具: {}", e)),
+                                }
+                            }
+                            None => ui::warn(&format!("未在 {} 下找到可用密钥或用户取消，跳过签名。", key_dir_fallback(exe_dir).display())),
+                        }
+                    }
+
                     if !ui::confirm("确定要继续刷入吗？", true) {
                         ui::warn("已取消刷入操作，修补镜像已保存。");
                         return;
@@ -820,7 +993,7 @@ async fn flash_magisk(flasher: &Flasher) {
                     }
 
                     ui::step(&format!("正在刷入 {} 分区...", partition));
-                    match flasher.flash_partition(&target_device, &partition, &patched_path).await {
+                    match flasher.flash_partition(&target_device, &partition, &final_image_path).await {
                         Ok(_) => ui::ok("刷入成功！"),
                         Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
                     }
@@ -908,30 +1081,162 @@ async fn flash_apatch(flasher: &Flasher) {
              Ok(_) => {
                  ui::ok("APatch 修补成功！");
                  println!("您的 SuperKey 为: {}", skey);
-                  
-                  print!("是否立即刷入到 {} 分区? [Y/n]: ", target_partition);
+                 
+                 let exe_path = env::current_exe().unwrap_or(PathBuf::from("rua_flash_tool.exe"));
+                 let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
+                 let mut final_image_path = format!("apatch_patched_{}.img", target_partition);
+                 print!("是否对修补后镜像进行 AVB 签名？[y/N]: ");
+                 let _ = io::stdout().flush();
+                 let mut sign_ans = String::new();
+                 let _ = io::stdin().read_line(&mut sign_ans);
+                 let sign_ans = sign_ans.trim().to_lowercase();
+                 if sign_ans == "y" || sign_ans == "yes" {
+                     match select_avb_key_dir_and_file(exe_dir) {
+                         Some((_key_dir, key_path)) => {
+                             ui::step(&format!("将使用密钥: {}", key_path.display()));
+                             match try_sign_with_external_tools(&flasher.client, None, &final_image_path, target_partition, &key_path).await {
+                                 Ok(signed_path) => {
+                                     ui::ok(&format!("签名成功: {}", signed_path));
+                                     final_image_path = signed_path;
+                                 }
+                                 Err(e) => ui::warn(&format!("签名失败或未找到可用工具: {}", e)),
+                             }
+                         }
+                         None => ui::warn(&format!("未在 {} 下找到可用密钥或用户取消，跳过签名。", key_dir_fallback(exe_dir).display())),
+                     }
+                 }
+
+                 print!("是否立即刷入到 {} 分区? [Y/n]: ", target_partition);
                   let _ = io::stdout().flush();
                   let mut confirm = String::new();
                   let _ = io::stdin().read_line(&mut confirm);
                   let confirm = confirm.trim().to_lowercase();
                   if confirm.is_empty() || confirm == "y" {
                       ui::step(&format!("正在刷入到 {} 分区...", target_partition));
-                      let out_name = format!("apatch_patched_{}.img", target_partition);
-                      match flasher.client.run(&["flash", target_partition, &out_name]).await {
+                      match flasher.client.run(&["flash", target_partition, &final_image_path]).await {
                           Ok(true) => {
                               ui::ok("刷入成功！");
                               println!("刷写完毕！请牢记您的 SuperKey: {}", skey);
-                              let _ = std::fs::remove_file(&out_name);
+                              let _ = std::fs::remove_file(&final_image_path);
                           }
                           _ => ui::err("刷入失败，请检查 fastboot 连接"),
                       }
                   } else {
-                      println!("已取消刷入。");
+                      println!("已取消刷入，修补镜像已保存为: {}", final_image_path);
                   }
              }
             Err(e) => ui::err(&format!("APatch 修补失败: {:?}", e)),
         }
     }
+}
+
+fn key_dir_fallback(exe_dir: &Path) -> PathBuf {
+    // 多候选路径，兼容 cargo run 情况（项目根目录）
+    let mut candidates = Vec::new();
+    candidates.push(exe_dir.join("avbkey"));
+    candidates.push(exe_dir.join("AVBKEY"));
+    candidates.push(exe_dir.join("..").join("..").join("avbkey"));
+    candidates.push(exe_dir.join("..").join("..").join("AVBKEY"));
+    for p in candidates {
+        if p.exists() && p.is_dir() {
+            return p;
+        }
+    }
+    exe_dir.join("avbkey")
+}
+
+fn select_avb_key_dir_and_file(exe_dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let guess_dir = key_dir_fallback(exe_dir);
+    let key_dir = if guess_dir.exists() && guess_dir.is_dir() {
+        guess_dir
+    } else {
+        println!("{}", "未在程序目录下找到 avbkey 文件夹，请手动选择密钥目录".cyan());
+        ui::select_directory("请选择存放 AVB 密钥 (.pem) 的目录")?
+    };
+
+    let mut pem_all: Vec<PathBuf> = std::fs::read_dir(&key_dir).ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().map_or(false, |e| e.eq_ignore_ascii_case("pem")))
+        .collect();
+    pem_all.sort();
+
+    if pem_all.is_empty() {
+        ui::err("该目录下未找到任何 .pem 文件。");
+        return None;
+    }
+
+    let pem_files = pem_all;
+
+    println!("\n{} {}", ">>".cyan().bold(), "检测到以下可用密钥:".bright_white());
+    let divider = "=".repeat(60).white();
+    println!("{}", divider);
+    for (i, p) in pem_files.iter().enumerate() {
+        let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("<unknown>");
+        let mut line = name.to_string();
+        if name.to_lowercase().contains("pub") {
+            line.push_str("  (公钥，一般不可用)");
+        }
+        println!("{}{}", format!("{:>3}. ", i + 1).bright_cyan(), line);
+    }
+    println!("{}", divider);
+    print!("请选择密钥: ");
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+    let idx: usize = input.trim().parse().unwrap_or(0);
+    if idx == 0 || idx > pem_files.len() {
+        ui::err("无效的选择。");
+        return None;
+    }
+    let picked = pem_files[idx - 1].clone();
+    let picked_name = picked.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if picked_name.to_lowercase().contains("pub") {
+        ui::err("选择的是公钥文件，无法用于签名。请使用私钥 .pem。");
+        return None;
+    }
+    Some((key_dir, picked))
+}
+
+async fn try_sign_with_external_tools(
+    _base_client: &FastbootClient,
+    _serial: Option<&str>,
+    image_path: &str,
+    partition: &str,
+    key_path: &Path,
+) -> anyhow::Result<String> {
+    println!("{}", ">> 开始 AVB 签名流程".cyan());
+
+    let img_len = std::fs::metadata(image_path).map(|m| m.len()).unwrap_or(0);
+    let mib = 1024u64 * 1024u64;
+    // 兜底：为 vbmeta+footer 预留余量（至少 2 MiB），再按 MiB 向上取整
+    let min_slack = 2 * mib;
+    let required = img_len.saturating_add(min_slack);
+    let part_size_bytes = ((required + mib - 1) / mib) * mib;
+    println!("{}", format!(">> 分区大小(兜底，含余量): {} bytes", part_size_bytes).yellow());
+
+    let algo = if key_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| n.to_lowercase().contains("rsa4096"))
+        .unwrap_or(false)
+    {
+        "SHA256_RSA4096"
+    } else {
+        "SHA256_RSA2048"
+    };
+
+    let signed = rua_core::avb::add_hash_footer(
+        image_path,
+        partition,
+        part_size_bytes,
+        &key_path.to_string_lossy(),
+        algo,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(format!("{:?}", e)))?;
+
+    Ok(signed)
 }
 
 async fn flash_kernelsu_lkm(flasher: &Flasher) {
@@ -1168,6 +1473,28 @@ async fn flash_kernelsu_lkm(flasher: &Flasher) {
             println!("{}", format!("  📝 修补后镜像: {}", out_name).cyan());
             println!("{}", "=".repeat(60).white());
 
+            let mut final_image_path = out_name.clone();
+            print!("是否对修补后镜像进行 AVB 签名？[y/N]: ");
+            let _ = io::stdout().flush();
+            let mut sign_ans = String::new();
+            let _ = io::stdin().read_line(&mut sign_ans);
+            let sign_ans = sign_ans.trim().to_lowercase();
+            if sign_ans == "y" || sign_ans == "yes" {
+                match select_avb_key_dir_and_file(exe_dir) {
+                    Some((_key_dir, key_path)) => {
+                        ui::step(&format!("将使用密钥: {}", key_path.display()));
+                        match try_sign_with_external_tools(&flasher.client, None, &final_image_path, &partition, &key_path).await {
+                            Ok(signed_path) => {
+                                ui::ok(&format!("签名成功: {}", signed_path));
+                                final_image_path = signed_path;
+                            }
+                            Err(e) => ui::warn(&format!("签名失败或未找到可用工具: {}", e)),
+                        }
+                    }
+                    None => ui::warn(&format!("未在 {} 下找到可用密钥或用户取消，跳过签名。", key_dir_fallback(exe_dir).display())),
+                }
+            }
+
             if ui::confirm("确定要继续刷入吗？", true) {
                 let target_device = select_device(&flasher.client).await;
                 if target_device.is_empty() {
@@ -1175,15 +1502,15 @@ async fn flash_kernelsu_lkm(flasher: &Flasher) {
                     return;
                 }
                 ui::step(&format!("正在刷入 {} 分区...", partition));
-                match flasher.flash_partition(&target_device, &partition, &out_name).await {
+                match flasher.flash_partition(&target_device, &partition, &final_image_path).await {
                     Ok(_) => {
                         ui::ok("刷入成功！");
-                        let _ = std::fs::remove_file(&out_name);
+                        let _ = std::fs::remove_file(&final_image_path);
                     }
                     Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
                 }
             } else {
-                println!("已取消刷入，修补镜像已保存为: {}", out_name);
+                println!("已取消刷入，修补镜像已保存为: {}", final_image_path);
             }
         }
         Err(e) => ui::err(&format!("KernelSU LKM 修补失败: {:?}", e)),
@@ -1249,7 +1576,30 @@ async fn flash_anykernel3(flasher: &Flasher) {
             match flasher.anykernel3_root(&zip_path.to_string_lossy(), &boot_path.to_string_lossy(), target_partition, is_raw_kernel, false).await {
                 Ok(out_name) => {
                     ui::ok("内核修补成功！");
-                    
+                    let exe_path = env::current_exe().unwrap_or(PathBuf::from("rua_flash_tool.exe"));
+                    let exe_dir = exe_path.parent().unwrap_or(Path::new("."));
+                    let mut final_image_path = out_name.clone();
+                    print!("是否对修补后镜像进行 AVB 签名？[y/N]: ");
+                    let _ = io::stdout().flush();
+                    let mut sign_ans = String::new();
+                    let _ = io::stdin().read_line(&mut sign_ans);
+                    let sign_ans = sign_ans.trim().to_lowercase();
+                    if sign_ans == "y" || sign_ans == "yes" {
+                        match select_avb_key_dir_and_file(exe_dir) {
+                            Some((_key_dir, key_path)) => {
+                                ui::step(&format!("将使用密钥: {}", key_path.display()));
+                                match try_sign_with_external_tools(&flasher.client, None, &final_image_path, target_partition, &key_path).await {
+                                    Ok(signed_path) => {
+                                        ui::ok(&format!("签名成功: {}", signed_path));
+                                        final_image_path = signed_path;
+                                    }
+                                    Err(e) => ui::warn(&format!("签名失败或未找到可用工具: {}", e)),
+                                }
+                            }
+                            None => ui::warn(&format!("未在 {} 下找到可用密钥或用户取消，跳过签名。", key_dir_fallback(exe_dir).display())),
+                        }
+                    }
+
                     print!("是否立即刷入到 {} 分区? [Y/n]: ", target_partition);
                     let _ = io::stdout().flush();
                     let mut confirm = String::new();
@@ -1262,15 +1612,15 @@ async fn flash_anykernel3(flasher: &Flasher) {
                             return;
                         }
                         ui::step(&format!("正在刷入到 {} 分区...", target_partition));
-                        match flasher.flash_partition(&target_device, target_partition, &out_name).await {
+                        match flasher.flash_partition(&target_device, target_partition, &final_image_path).await {
                             Ok(_) => {
                                 ui::ok("刷入成功！");
-                                let _ = std::fs::remove_file(&out_name);
+                                let _ = std::fs::remove_file(&final_image_path);
                             }
                             Err(_) => ui::err("刷入失败，请检查 fastboot 连接"),
                         }
                     } else {
-                        println!("已取消刷入，修补镜像已保存为: {}", out_name);
+                        println!("已取消刷入，修补镜像已保存为: {}", final_image_path);
                     }
                 }
                 Err(e) => ui::err(&format!("AnyKernel3 修补失败: {:?}", e)),
@@ -1391,7 +1741,7 @@ async fn disable_avb(flasher: &Flasher) {
     }
 
     ui::step("正在刷入 vbmeta.img 并关闭 AVB 校验...");
-    match flasher.flash_partition(&target_device, "vbmeta", &vbmeta_path.to_string_lossy()).await {
+    match flasher.flash_vbmeta(&target_device, &vbmeta_path.to_string_lossy()).await {
         Ok(_) => ui::ok("vbmeta 刷入成功，AVB 校验已禁用。"),
         Err(e) => ui::err(&format!("vbmeta 刷入失败: {:?}", e)),
     }
@@ -1399,9 +1749,29 @@ async fn disable_avb(flasher: &Flasher) {
 
 fn open_cmd() {
     ui::step("正在打开新命令行窗口...");
-    // 在 Windows 下使用 start 命令启动新的 cmd 窗口
+    let exe_path = env::current_exe().unwrap_or(std::path::PathBuf::from("rua_flash_tool.exe"));
+    let exe_dir = exe_path.parent().unwrap_or(std::path::Path::new("."));
+
+    let mut platform_tools = crate::utils::path_resolver::resolve_subdir_dev_release("platform-tools")
+        .unwrap_or_else(|| exe_dir.join("platform-tools"));
+    if !(platform_tools.exists() && platform_tools.is_dir()) {
+        if let Ok(mut cd) = env::current_dir() {
+            cd.push("platform-tools");
+            if cd.exists() && cd.is_dir() {
+                platform_tools = cd;
+            }
+        }
+    }
+
+    // 启动新的 cmd 窗口并将工作目录设为 platform-tools（如果存在）
+    let target_dir = if platform_tools.exists() && platform_tools.is_dir() {
+        platform_tools.to_string_lossy().to_string()
+    } else {
+        exe_dir.to_string_lossy().to_string()
+    };
+
     let _ = std::process::Command::new("cmd")
-        .args(&["/c", "start", "cmd.exe"])
+        .args(&["/C", "start", "", "/D", &target_dir, "cmd.exe"])
         .spawn();
 }
 
@@ -1549,15 +1919,42 @@ async fn install_apk() {
 }
 
 async fn factory_reset(client: &FastbootClient) {
-    if ui::confirm("确定要恢复出厂设置吗？这将清除所有数据！", false) {
-        ui::step("正在检测 Fastboot 设备...");
-        let target_device = select_device(client).await;
-        if target_device.is_empty() {
-            ui::err("未检测到 Fastboot 设备，无法执行清除操作。");
-            pause_before_back();
-            return;
-        }
+    if !ui::confirm("确定要恢复出厂设置吗？这将清除所有数据！", false) {
+        pause_before_back();
+        return;
+    }
 
+    println!("\n{} {}", ">>".cyan().bold(), "注意：部分机型（如 ColorOS、华为）直接擦除 userdata 可能缺少必要文件影响使用。".bright_white());
+    println!("{}", "你可以在此指定“无用户数据”的 userdata.img 刷入，或继续直接擦除分区。".bright_black());
+    println!("\n请选择操作:");
+    println!("1. 直接擦除 userdata 分区（erase + format）");
+    println!("2. 指定无用户数据的 userdata.img 刷入");
+    print!("请输入选择 (1-2，默认 1): ");
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+    let choice = input.trim();
+
+    ui::step("正在检测 Fastboot 设备...");
+    let target_device = select_device(client).await;
+    if target_device.is_empty() {
+        ui::err("未检测到 Fastboot 设备，无法继续。");
+        pause_before_back();
+        return;
+    }
+
+    if choice == "2" {
+        if let Some(img_path) = ui::select_file("请选择无用户数据的 userdata.img", &["img"]) {
+            let flasher = Flasher::new(client.clone());
+            ui::step(&format!("正在刷入 userdata: {} ...", img_path.display()));
+            match flasher.flash_partition(&target_device, "userdata", &img_path.to_string_lossy()).await {
+                Ok(_) => ui::ok("刷入完成。"),
+                Err(e) => ui::err(&format!("刷入失败: {:?}", e)),
+            }
+        } else {
+            ui::warn("未选择镜像文件，已取消。");
+        }
+    } else {
         ui::step("正在清除 Data 分区...");
         if let Err(e) = client.erase("userdata").await {
             ui::err(&format!("清除失败: {:?}", e));
@@ -1566,8 +1963,8 @@ async fn factory_reset(client: &FastbootClient) {
         if let Err(e) = client.format("userdata").await {
             ui::err(&format!("格式化失败: {:?}", e));
         }
-        ui::ok("恢复出厂设置操作完成。");
     }
+    ui::ok("恢复出厂设置操作完成。");
     pause_before_back();
 }
 
@@ -1687,42 +2084,103 @@ async fn switch_slot(client: &FastbootClient) {
     pause_before_back();
 }
 
-async fn activate_shizuku() {
-    ui::step("正在激活 Shizuku...");
+async fn activate_adb_menu() {
     let mut adb_devs = Vec::new();
     if let Ok(adb) = rua_core::AdbClient::new() {
         if let Ok(devs) = adb.list_devices().await {
             adb_devs = devs;
         }
     }
-
     if adb_devs.is_empty() {
         ui::err("未发现 ADB 模式的设备。");
-    } else {
-        let dev = if adb_devs.len() == 1 {
-            &adb_devs[0]
-        } else {
-            println!("\n{} 请选择要激活 Shizuku 的设备:", ">>".cyan());
-            for (i, d) in adb_devs.iter().enumerate() {
-                println!("  {}. {} ({})", i + 1, d.serial, d.product.as_deref().unwrap_or("未知"));
-            }
-            print!("请选择: ");
-            let _ = io::stdout().flush();
-            let mut input = String::new();
-            let _ = io::stdin().read_line(&mut input);
-            let idx: usize = input.trim().parse().unwrap_or(0);
-            if idx == 0 || idx > adb_devs.len() {
-                ui::err("选择无效。");
-                pause_before_back();
-                return;
-            }
-            &adb_devs[idx - 1]
-        };
+        pause_before_back();
+        return;
+    }
 
-        if let Ok(adb) = rua_core::AdbClient::new() {
-            match adb.activate_shizuku(&dev.serial).await {
-                Ok(out) => ui::ok(&format!("Shizuku 激活输出:\n{}", out)),
-                Err(e) => ui::err(&format!("激活失败: {:?}", e)),
+    let dev = if adb_devs.len() == 1 {
+        &adb_devs[0]
+    } else {
+        println!("\n{} 请选择目标设备:", ">>".cyan());
+        for (i, d) in adb_devs.iter().enumerate() {
+            println!("  {}. {} ({})", i + 1, d.serial, d.product.as_deref().unwrap_or("未知"));
+        }
+        print!("请选择: ");
+        let _ = io::stdout().flush();
+        let mut input = String::new();
+        let _ = io::stdin().read_line(&mut input);
+        let idx: usize = input.trim().parse().unwrap_or(0);
+        if idx == 0 || idx > adb_devs.len() {
+            ui::err("选择无效。");
+            pause_before_back();
+            return;
+        }
+        &adb_devs[idx - 1]
+    };
+
+    println!("\n{} {}", ">>".cyan().bold(), "请选择需要激活的工具:".bright_white());
+    println!("1. Shizuku");
+    println!("2. 冰箱 (ADB 模式)");
+    println!("3. 冰箱设为设备管理员 (Device Owner)");
+    println!("4. 黑阈 (Brevent)");
+    println!("5. AXManager");
+    println!("6. 小黑屋 (web1n.stopapp)");
+    println!("7. 小黑屋设为设备管理员");
+    print!("请选择 (1-7): ");
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    let _ = io::stdin().read_line(&mut input);
+    let opt = input.trim();
+
+    if let Ok(adb) = rua_core::AdbClient::new() {
+        match opt {
+            "2" => {
+                ui::step("正在激活 冰箱 (ADB 模式)...");
+                match adb.activate_icebox_adb(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("激活失败: {:?}", e)),
+                }
+            }
+            "3" => {
+                ui::step("正在设置 冰箱 为设备管理员...");
+                match adb.activate_icebox_admin(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("设置失败: {:?}", e)),
+                }
+            }
+            "4" => {
+                ui::step("正在激活 黑阈 (Brevent)...");
+                match adb.activate_brevent(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("激活失败: {:?}", e)),
+                }
+            }
+            "5" => {
+                ui::step("正在激活 AXManager...");
+                match adb.activate_axmanager(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("激活失败: {:?}", e)),
+                }
+            }
+            "6" => {
+                ui::step("正在激活 小黑屋...");
+                match adb.activate_demon_mode(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("激活失败: {:?}", e)),
+                }
+            }
+            "7" => {
+                ui::step("正在将 小黑屋 设为设备管理员...");
+                match adb.activate_demon_admin(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("设置失败: {:?}", e)),
+                }
+            }
+            _ => {
+                ui::step("正在激活 Shizuku...");
+                match adb.activate_shizuku(&dev.serial).await {
+                    Ok(out) => ui::ok(&format!("Shizuku 激活输出:\n{}", out)),
+                    Err(e) => ui::err(&format!("激活失败: {:?}", e)),
+                }
             }
         }
     }

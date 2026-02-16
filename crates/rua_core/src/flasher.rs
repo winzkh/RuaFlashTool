@@ -3,9 +3,8 @@ use crate::error::{FlashError, Result};
 use crate::utils;
 use std::path::{Path, PathBuf};
 use std::fs::{self, File};
-use std::io::{Read, Write, Cursor};
+use std::io::{Read, Write};
 use android_bootimg::parser::BootImage;
-use android_bootimg::patcher::BootImagePatchOption;
 use zip::ZipArchive;
 use sha1::{Sha1, Digest};
 use flate2::write::GzEncoder;
@@ -56,8 +55,13 @@ impl Flasher {
         self.flash_partition("", "boot", path).await
     }
 
-    pub async fn flash_vbmeta(&self, path: &str) -> Result<()> {
-        if self.client.run(&["flash", "vbmeta", "--disable-verity", "--disable-verification", path]).await? {
+    pub async fn flash_vbmeta(&self, device_id: &str, path: &str) -> Result<()> {
+        let args: Vec<&str> = if device_id.is_empty() {
+            vec!["--disable-verity", "--disable-verification", "flash", "vbmeta", path]
+        } else {
+            vec!["-s", device_id, "--disable-verity", "--disable-verification", "flash", "vbmeta", path]
+        };
+        if self.client.run(&args).await? {
             Ok(())
         } else {
             Err(FlashError::FastbootError("Failed to flash vbmeta".into()))
@@ -80,12 +84,8 @@ impl Flasher {
         }
     }
 
-    pub async fn disable_avb(&self, vbmeta_path: &str) -> Result<()> {
-        if self.client.run(&["flash", "vbmeta", "--disable-verity", "--disable-verification", vbmeta_path]).await? {
-            Ok(())
-        } else {
-            Err(FlashError::FastbootError("Failed to disable AVB".into()))
-        }
+    pub async fn disable_avb(&self, device_id: &str, vbmeta_path: &str) -> Result<()> {
+        self.flash_vbmeta(device_id, vbmeta_path).await
     }
 
     pub fn detect_kmi_from_kernel(kernel_data: &[u8]) -> Option<String> {
@@ -286,13 +286,9 @@ impl Flasher {
         
         let new_cpio = utils::cpio_create_with_threecpio(&entries)?;
         let final_ramdisk = utils::compress_ramdisk(fmt, &new_cpio)?;
-        let mut patcher = BootImagePatchOption::new(&boot_img);
-        patcher.replace_ramdisk(Box::new(Cursor::new(final_ramdisk)), true);
-        let mut output_data = Cursor::new(Vec::new());
-        patcher.patch(&mut output_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
-        
+        let patched = crate::bootimg::patch_with_replacements(&boot_img, None, Some((final_ramdisk, true)))?;
         let out_name = format!("ksu_lkm_patched_{}.img", target_partition);
-        fs::write(&out_name, output_data.into_inner())?;
+        fs::write(&out_name, patched)?;
         Ok(out_name)
     }
 
@@ -366,11 +362,8 @@ impl Flasher {
             }
 
             let out_name = format!("apatch_patched_{}.img", target_partition);
-            let mut patcher = BootImagePatchOption::new(&boot_img);
-            patcher.replace_kernel(Box::new(Cursor::new(new_kernel_data)), false);
-            let mut output_data = Cursor::new(Vec::new());
-            patcher.patch(&mut output_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
-            fs::write(&out_name, output_data.into_inner())?;
+            let patched = crate::bootimg::patch_with_replacements(&boot_img, Some((new_kernel_data, false)), None)?;
+            fs::write(&out_name, patched)?;
 
             if auto_flash {
                 let res = self.client.run(&["flash", target_partition, &out_name]).await;
@@ -475,12 +468,8 @@ impl Flasher {
         } else {
             // 标准 Boot 模式，替换内核重新打包
             let boot_img = BootImage::parse(&old_boot_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
-            let mut patcher = BootImagePatchOption::new(&boot_img);
-            patcher.replace_kernel(Box::new(Cursor::new(kernel_data)), false);
-     
-            let mut output_data = Cursor::new(Vec::new());
-            patcher.patch(&mut output_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
-            fs::write(&out_name, output_data.into_inner())?;
+            let patched = crate::bootimg::patch_with_replacements(&boot_img, Some((kernel_data, false)), None)?;
+            fs::write(&out_name, patched)?;
         }
  
         if auto_flash {
@@ -673,13 +662,7 @@ impl Flasher {
 
         if is_init_boot {
             println!("{}", ">> 正在修补 BootImage (init_boot)...".cyan().bold());
-            // 使用 preserve_all=true 确保 V4 Header 字段被完整保留
-            let mut patcher = BootImagePatchOption::new(&boot_img);
-            patcher.replace_ramdisk(Box::new(Cursor::new(final_ramdisk)), true);
-
-            let mut output_data = Cursor::new(Vec::new());
-            patcher.patch(&mut output_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
-            let patched_image = output_data.into_inner();
+            let patched_image = crate::bootimg::patch_with_replacements(&boot_img, None, Some((final_ramdisk, true)))?;
             println!("{}", format!(">> 修补后镜像大小: {} bytes", patched_image.len()).green());
 
             let out_name = format!("magisk_patched_{}.img", if target_partition.is_empty() { "init_boot" } else { target_partition });
@@ -702,24 +685,18 @@ impl Flasher {
             }
         } else {
             println!("{}", ">> 正在修补 BootImage...".cyan().bold());
-            // 普通 boot 分区也使用 preserve_all=true，以确保最大的兼容性
-            let mut patcher = BootImagePatchOption::new(&boot_img);
-            patcher.replace_ramdisk(Box::new(Cursor::new(final_ramdisk)), true);
-
+            let mut kernel_rep = None;
             if let Some(kernel) = boot_img.get_blocks().get_kernel() {
                 let kernel_bytes = kernel.get_data();
                 let patched_kernel = Self::hex_patch_kernel_skip_initramfs(kernel_bytes);
                 if let Some(pbytes) = patched_kernel {
                     println!("{}", ">> 已对内核应用 skip_initramfs→want_initramfs 补丁".green());
-                    patcher.replace_kernel(Box::new(Cursor::new(pbytes)), false);
+                    kernel_rep = Some((pbytes, false));
                 } else {
                     println!("{}", ">> 未找到可替换的 skip_initramfs，跳过内核十六进制补丁".yellow());
                 }
             }
-
-            let mut output_data = Cursor::new(Vec::new());
-            patcher.patch(&mut output_data).map_err(|e| FlashError::PatchError(e.to_string()))?;
-            let patched_image = output_data.into_inner();
+            let patched_image = crate::bootimg::patch_with_replacements(&boot_img, kernel_rep, Some((final_ramdisk, true)))?;
             println!("{}", format!(">> 修补后镜像大小: {} bytes", patched_image.len()).green());
 
             let out_name = format!("magisk_patched_{}.img", if target_partition.is_empty() { "boot" } else { target_partition });

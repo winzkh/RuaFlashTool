@@ -121,6 +121,16 @@ if (Test-Path $driversPath) {
     Write-Host "警告: 未找到 drivers 目录。请确保它存在于项目根目录，否则将不会被打包。" -ForegroundColor Yellow
 }
 
+# 8. 复制 avbkey 目录 (假设存在于项目根目录)
+Write-Host "复制 avbkey 目录..." -ForegroundColor Cyan
+$avbkeyPath = "avbkey"
+if (Test-Path $avbkeyPath) {
+    Copy-Item $avbkeyPath -Destination $outputDir -Recurse
+    Write-Host "avbkey 复制成功。" -ForegroundColor Green
+} else {
+    Write-Host "警告: 未找到 avbkey 目录。请确保它存在于项目根目录，否则将不会被打包。" -ForegroundColor Yellow
+}
+
 Write-Host "打包完成！发布文件位于 '$outputDir' 目录。" -ForegroundColor Green
 
 # 9. 使用 7-Zip 创建自解压包 (SFX)

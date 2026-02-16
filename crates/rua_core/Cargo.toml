@@ -1,6 +1,6 @@
 [package]
 name = "rua_core"
-version = "1.0.0-rc0"
+version = "1.0.0-rc2"
 edition = "2024"
 license = "GPL-3.0"
 repository = "https://github.com/yourusername/RuaFlashTool"
@@ -13,6 +13,7 @@ tokio = { version = "1", features = ["full"] }
 android-bootimg = { git = "https://github.com/5ec1cff/android_bootimg", branch = "master" }
 lzma-rs = "0.3.0"
 sha1 = "0.10.6"
+sha2 = "0.10"
 flate2 = "1.0.35"
 zip = { version = "2.2.3", default-features = false, features = ["deflate"] }
 zstd = "0.13"
@@ -33,3 +34,6 @@ scopeguard = "1.2.0"
 tracing = "0.1"
 regex = "1.10"
 payload_dumper = { version = "0.8", features = ["remote_zip"] }
+rsa = { version = "0.9", features = ["sha2"] }
+num-bigint = "0.4"
+rand = "0.8"
